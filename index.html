@@ -233,7 +233,11 @@
       footer { margin-top: 44px; color: var(--ink-3); font-size: 12.5px; text-align: center; }
       @media (max-width: 560px) {
         table.report { font-size: 12px; }
-        table.report th, table.report td { padding: 7px 6px; }
+        table.report th, table.report td { padding: 7px 4px; }
+        /* On a phone, drop the pay-rate column from the payroll table so
+           every worker's hours and total pay fit without sideways scrolling.
+           The rate still shows in the findings when it matters. */
+        #lcp-table table.report th:nth-child(5), #lcp-table table.report td:nth-child(5) { display: none; }
         table.report .who { white-space: normal; }
         table.report .sub { display: none; }
         table.report .num { font-size: 11.5px; }
@@ -404,6 +408,19 @@
       };
 
       const DEFAULT_RATES = { "Carpenter": 58.20, "Laborer": 44.65, "Electrician": 62.80, "Operating Engineer": 59.75, "Ironworker": 63.10 };
+      /* The "required rate" for a job is the top rate anyone on the loaded
+         payroll is paid for that job — on the sample payrolls those top rates
+         are exactly the prevailing rates above. Jobs that never appear on the
+         payroll fall back to the sample table (used only for rough money
+         estimates on workers missing from payroll). */
+      function currentRates() {
+        const rates = {};
+        Object.values(lcpData).forEach((p) => ((p && p.rows) || []).forEach((r) => {
+          if (r.cls && r.rate > 0) rates[r.cls] = Math.max(rates[r.cls] || 0, r.rate);
+        }));
+        Object.keys(DEFAULT_RATES).forEach((k) => { if (!(k in rates)) rates[k] = DEFAULT_RATES[k]; });
+        return rates;
+      }
       const COST_CODES = { "Carpenter": "06 200 · Rough Carpentry", "Laborer": "02 410 · Selective Demolition", "Electrician": "26 050 · Basic Electrical", "Operating Engineer": "31 200 · Earth Moving", "Ironworker": "05 120 · Structural Steel" };
 
       let procoreData = structuredClone(SAMPLE_PROCORE);
@@ -480,7 +497,7 @@
             const t = totals(r.days); const gross = t.st * r.rate + t.ot * r.rate * 1.5; wg += gross; rowCount++; grand += t.total;
             html += "<tr><td><span class='who'>" + esc(displayName(r.name)) + "</span><span class='sub mono'>···" + esc(r.id4 || "") + "</span></td><td>" + esc(r.cls) + "</td><td class='num'>" + fmtH(t.st) + "</td><td class='num'>" + fmtH(t.ot) + "</td><td class='num'>" + fmt$(r.rate) + "</td><td class='num'>" + fmt$(gross) + "</td></tr>";
           });
-          html += "</tbody><tfoot><tr><td colspan='5'>Total pay this week</td><td class='num'>" + fmt$(wg) + "</td></tr></tfoot></table>";
+          html += "</tbody><tfoot><tr><td colspan='6'>Total pay this week<span style='float:right'>" + fmt$(wg) + "</span></td></tr></tfoot></table>";
         });
         $("#lcp-table").innerHTML = html;
         $("#lcp-meta").innerHTML = metaBits.map((m) => "<span>" + m + "</span>").join("");
@@ -544,13 +561,15 @@
         const rows = parseCsv(text); if (rows.length < 2) throw new Error("empty");
         const H = rows[0];
         const ci = {
-          name: findCol(H, [(h) => h.includes("employee") && h.includes("name"), (h) => h === "name", (h) => h.includes("worker")]),
+          name: findCol(H, [(h) => h.includes("employee") && h.includes("name"), (h) => h === "name", (h) => h.includes("worker"), (h) => h === "employee", (h) => h.includes("employee")]),
           id: findCol(H, [(h) => h.includes("employeeid"), (h) => h === "id"]),
           date: findCol(H, [(h) => h === "date", (h) => h.includes("workdate")]),
           cls: findCol(H, [(h) => h.includes("classification"), (h) => h.includes("trade")]),
           type: findCol(H, [(h) => h.includes("timetype"), (h) => h === "type"]),
           hours: findCol(H, [(h) => h === "hours", (h) => h.includes("totalhours")]),
           week: findCol(H, [(h) => h.includes("weekending")]),
+          reg: findCol(H, [(h) => h.includes("regular") && h.includes("hour")]),
+          ot: findCol(H, [(h) => h.includes("overtime"), (h) => h.includes("othours"), (h) => h.startsWith("ot") && h.includes("hour")]),
           tot: findCol(H, [(h) => h.includes("total") && h.includes("hour")])
         };
         if (ci.name < 0 || (ci.date < 0 && ci.week < 0)) throw new Error("headers");
@@ -576,11 +595,13 @@
             const d = new Date(String(row[ci.date]).slice(0, 10) + "T12:00:00");
             const idx = (d.getDay() + 6) % 7;
             rec.days[idx] = [rec.days[idx][0] + st, rec.days[idx][1] + ot];
-          } else if (ci.tot >= 0) {
-            push(we, name, ci.id >= 0 ? row[ci.id] : "", ci.cls >= 0 ? row[ci.cls] : "", parseFloat(row[ci.tot]) || 0, 0);
+          } else if (ci.reg >= 0 || ci.ot >= 0 || ci.tot >= 0) {
+            const otv = ci.ot >= 0 ? parseFloat(row[ci.ot]) || 0 : 0;
+            const stv = ci.reg >= 0 ? parseFloat(row[ci.reg]) || 0 : Math.max(0, (parseFloat(row[ci.tot]) || 0) - otv);
+            push(we, name, ci.id >= 0 ? row[ci.id] : "", ci.cls >= 0 ? row[ci.cls] : "", stv, otv);
           }
         }
-        Object.values(out).flat().forEach((rec) => { if (rec._flat) { rec.days = [D(rec._st || 0), D(0), D(0), D(0), D(0), D(rec._ot || 0), D(0)]; delete rec._flat; delete rec._st; delete rec._ot; } });
+        Object.values(out).flat().forEach((rec) => { if (rec._flat) { rec.days = [D(rec._st || 0), D(0), D(0), D(0), D(0), D(0, rec._ot || 0), D(0)]; delete rec._flat; delete rec._st; delete rec._ot; } });
         if (!Object.keys(out).length) throw new Error("rows");
         return out;
       }
@@ -592,8 +613,9 @@
           id: findCol(H, [(h) => h.includes("ssn") || h.includes("last4"), (h) => h.includes("employeeid")]),
           cls: findCol(H, [(h) => h.includes("classification"), (h) => h.includes("laborclass"), (h) => h.includes("craft")]),
           week: findCol(H, [(h) => h.includes("weekending"), (h) => h.includes("payperiodend")]),
+          reg: findCol(H, [(h) => h.includes("regular") && h.includes("hour")]),
           st: findCol(H, [(h) => h.includes("st") && h.includes("hour"), (h) => h.includes("straight")]),
-          ot: findCol(H, [(h) => h.includes("ot") && h.includes("hour"), (h) => h.includes("overtime")]),
+          ot: findCol(H, [(h) => h.includes("overtime"), (h) => h.includes("othours"), (h) => h.startsWith("ot") && h.includes("hour")]),
           tot: findCol(H, [(h) => h.includes("total") && h.includes("hour")]),
           rate: findCol(H, [(h) => h.includes("base") && h.includes("rate"), (h) => h.includes("hourlyrate"), (h) => h === "rateofpay", (h) => h.includes("rate")]),
           no: findCol(H, [(h) => h.includes("payrollno"), (h) => h.includes("payrollnumber")])
@@ -608,9 +630,9 @@
           let days;
           if (dayIdx.every((i) => i >= 0)) days = dayIdx.map((i) => D(parseFloat(row[i]) || 0));
           else {
-            const st = ci.st >= 0 ? parseFloat(row[ci.st]) || 0 : (ci.tot >= 0 ? parseFloat(row[ci.tot]) || 0 : 0);
             const ot = ci.ot >= 0 ? parseFloat(row[ci.ot]) || 0 : 0;
-            days = [D(st), D(0), D(0), D(0), D(0), D(ot), D(0)];
+            const st = ci.reg >= 0 ? parseFloat(row[ci.reg]) || 0 : (ci.st >= 0 ? parseFloat(row[ci.st]) || 0 : Math.max(0, (ci.tot >= 0 ? parseFloat(row[ci.tot]) || 0 : 0) - ot));
+            days = [D(st), D(0), D(0), D(0), D(0), D(0, ot), D(0)];
           }
           out[we].rows.push({ name, id4: ci.id >= 0 ? String(row[ci.id]).replace(/\D/g, "").slice(-4) : "", cls: ci.cls >= 0 ? row[ci.cls] : "", rate: ci.rate >= 0 ? parseFloat(row[ci.rate]) || 0 : 0, days });
         }
@@ -765,7 +787,7 @@
         const btn = $("#run"); const status = $("#run-status");
         btn.disabled = true; status.className = "hook-status"; status.textContent = "Checking…";
         const weeks = Array.from(new Set([...Object.keys(procoreData), ...Object.keys(lcpData)])).sort();
-        const result = reconcile({ weeks, tol: 0.25, lagDays: 7, mode: "smart", rates: DEFAULT_RATES });
+        const result = reconcile({ weeks, tol: 0.25, lagDays: 7, mode: "smart", rates: currentRates() });
         lastFindings = result.findings; lastClean = result.clean;
         renderResults(result);
         status.className = "hook-status ok";
