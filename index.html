@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Subcontractor Log Updater</title>
+<title>Subcontract Log Updater</title>
 <style>
   :root{
     --ink:#1a2332; --muted:#5b6b82; --line:#d7dee8; --bg:#f4f6f9; --card:#ffffff;
@@ -125,12 +125,11 @@
     </div>
   </section>
 
-  <!-- STEP 3 : mapping -->
+  <!-- STEP 3 : paid roll and date -->
   <section class="card locked hidden" id="card-mapping">
-    <h2><span class="step">3</span>Confirm which columns get updated</h2>
-    <p class="sub">The PDF log and your file name their columns differently, so confirm the matches below.
+    <h2><span class="step">3</span>Paid columns and date</h2>
+    <p class="sub">The columns are matched automatically: the PDF's Original, Approved and Revised amounts update the matching columns in your file, and the Paid columns roll forward as described below.
        The PDF's Pending, Invoiced and Retained amounts have no matching column in the tracking log and are never written.</p>
-    <div class="mapgrid" id="map-grid"></div>
     <div id="paid-panel" style="margin-top:14px"></div>
     <div class="btnrow">
       <button class="btn" id="btn-compare">Compare the two files</button>
@@ -908,7 +907,7 @@
 const C = window.SLUCore;
 const $ = id => document.getElementById(id);
 const state = {
-  sheetName:'', sheetTab:'', sheetGrid:null, sheetModel:null, isXlsx:false, sharedConverted:0, sharedDropped:0,
+  sheetName:'', sheetTab:'', sheetGrid:null, sheetModel:null, isXlsx:false, sharedConverted:0, sharedDropped:0, cachesRefreshed:0,
   pdfName:'', pdfRows:[], pdfTotals:null, pdfWarnings:[], pdfLogDate:'',
   mapping:null, cmp:null
 };
@@ -1001,6 +1000,173 @@ async function sanitizeSharedFormulas(buf){
   return { buf: out, converted, dropped };
 }
 
+/* ---------- Excel table preservation ----------
+   The library that writes the workbook re-creates any Excel Tables it
+   finds, and does it badly: it writes headerRowCount="0" and never moves
+   the table ranges when rows are inserted, so Excel opens the result
+   with a repair prompt ("Removed records: AutoFilter from
+   /xl/tables/table1.xml"). The fix: remember every table exactly as the
+   uploaded file defines it, and after the workbook is written, put
+   those definitions back, with the ranges adjusted for the row or
+   column this run inserted. */
+
+async function captureTables(buf){
+  const tables = [];
+  if(typeof JSZip === 'undefined') return tables;
+  let zip;
+  try { zip = await JSZip.loadAsync(buf); } catch(e){ return tables; }
+  const read = async p => { const f = zip.file(p); return f ? await f.async('string') : null; };
+  const wbXml = await read('xl/workbook.xml');
+  const wbRels = await read('xl/_rels/workbook.xml.rels');
+  if(!wbXml || !wbRels) return tables;
+  const relTarget = {};
+  for(const m of wbRels.matchAll(/<Relationship[^>]*>/g)){
+    const idM = /Id="([^"]+)"/.exec(m[0]), tM = /Target="([^"]+)"/.exec(m[0]);
+    if(idM && tM) relTarget[idM[1]] = tM[1];
+  }
+  for(const m of wbXml.matchAll(/<sheet[^>]*>/g)){
+    const nameM = /name="([^"]+)"/.exec(m[0]), idM = /r:id="([^"]+)"/.exec(m[0]);
+    if(!nameM || !idM || !relTarget[idM[1]]) continue;
+    let target = relTarget[idM[1]].replace(/^\//, '');
+    if(!target.startsWith('xl/')) target = 'xl/' + target.replace(/^\.\//, '');
+    const sheetDir = target.slice(0, target.lastIndexOf('/'));
+    const sheetFile = target.slice(target.lastIndexOf('/') + 1);
+    const relsXml = await read(sheetDir + '/_rels/' + sheetFile + '.rels');
+    if(!relsXml) continue;
+    for(const rm of relsXml.matchAll(/<Relationship[^>]*>/g)){
+      if(!/\/table"/.test(rm[0])) continue;
+      const tM = /Target="([^"]+)"/.exec(rm[0]);
+      if(!tM) continue;
+      let part = tM[1];
+      if(part.startsWith('../')) part = 'xl/' + part.slice(3);
+      else if(!part.startsWith('xl/')) part = sheetDir + '/' + part.replace(/^\.\//, '');
+      const xml = await read(part);
+      if(xml) tables.push({ sheet: nameM[1], part, xml });
+    }
+  }
+  return tables;
+}
+
+function parseA1Range(ref){
+  const mm = /^\$?([A-Z]+)\$?(\d+):\$?([A-Z]+)\$?(\d+)$/.exec(String(ref || '').trim());
+  if(!mm) return null;
+  return { c1: colToNumT(mm[1]), r1: +mm[2], c2: colToNumT(mm[3]), r2: +mm[4] };
+}
+function fmtA1Range(r){ return numToColT(r.c1) + r.r1 + ':' + numToColT(r.c2) + r.r2; }
+
+function adjustTableXml(xml, delta){
+  let out = xml;
+  const totalsM = /totalsRowCount="(\d+)"/.exec(out);
+  const totals = totalsM ? +totalsM[1] : 0;
+  const shift = (r, isFilter) => {
+    if(!r) return r;
+    if(delta.colAt1){
+      if(delta.colAt1 <= r.c1){ r.c1++; r.c2++; }
+      else if(delta.colAt1 <= r.c2){ r.c2++; }
+    }
+    if(delta.rowAt1 && delta.rowCount){
+      const bound = isFilter ? r.r2 + 1 : (totals > 0 ? r.r2 : r.r2 + 1);
+      if(delta.rowAt1 <= r.r1){ r.r1 += delta.rowCount; r.r2 += delta.rowCount; }
+      else if(delta.rowAt1 <= bound){ r.r2 += delta.rowCount; }
+    }
+    return r;
+  };
+  const origTableRef = parseA1Range((/<table[^>]*? ref="([^"]+)"/.exec(out) || [])[1]);
+  out = out.replace(/(<table[^>]*? ref=")([^"]+)(")/, (m0, a, ref, b) => { const r = shift(parseA1Range(ref), false); return r ? a + fmtA1Range(r) + b : m0; });
+  out = out.replace(/(<autoFilter[^>]*? ref=")([^"]+)(")/, (m0, a, ref, b) => { const r = shift(parseA1Range(ref), true); return r ? a + fmtA1Range(r) + b : m0; });
+  // A column inserted inside the table also needs a new tableColumn entry.
+  if(delta.colAt1 && origTableRef && delta.colAt1 > origTableRef.c1 && delta.colAt1 <= origTableRef.c2){
+    const seg = /(<tableColumns[^>]*>)([\s\S]*?)(<\/tableColumns>)/.exec(out);
+    if(seg){
+      const parts = seg[2].split(/(?=<tableColumn[\s>])/).filter(x => x.trim().length);
+      let maxId = 0;
+      for(const p of parts){ const im = /id="(\d+)"/.exec(p); if(im) maxId = Math.max(maxId, +im[1]); }
+      const nm = String(delta.newColName || 'Paid').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+      parts.splice(Math.min(delta.colAt1 - origTableRef.c1, parts.length), 0, '<tableColumn id="' + (maxId + 1) + '" name="' + nm + '"/>');
+      out = out.replace(seg[0], seg[1] + parts.join('') + seg[3]);
+      out = out.replace(/(<tableColumns[^>]*? count=")(\d+)(")/, (m0, a, n, b) => a + (+n + 1) + b);
+    }
+  }
+  return out;
+}
+
+async function restoreTables(outBuf, origTables, editedSheet, delta){
+  if(typeof JSZip === 'undefined' || !origTables.length) return { buf: outBuf, restored: 0 };
+  const zip = await JSZip.loadAsync(outBuf);
+  const bySheet = {};
+  for(const t of origTables) (bySheet[t.sheet] = bySheet[t.sheet] || []).push(t);
+  let restored = 0;
+  for(const t of origTables){
+    zip.file(t.part, t.sheet === editedSheet ? adjustTableXml(t.xml, delta) : t.xml);
+    restored++;
+  }
+  // Make sure each sheet still points at its table parts (the writer
+  // normally keeps the wiring; repair it if it did not).
+  const wbXml = await zip.file('xl/workbook.xml').async('string');
+  const wbRels = await zip.file('xl/_rels/workbook.xml.rels').async('string');
+  const relTarget = {};
+  for(const m of wbRels.matchAll(/<Relationship[^>]*>/g)){
+    const idM = /Id="([^"]+)"/.exec(m[0]), tM = /Target="([^"]+)"/.exec(m[0]);
+    if(idM && tM) relTarget[idM[1]] = tM[1];
+  }
+  for(const m of wbXml.matchAll(/<sheet[^>]*>/g)){
+    const nameM = /name="([^"]+)"/.exec(m[0]), idM = /r:id="([^"]+)"/.exec(m[0]);
+    if(!nameM || !idM) continue;
+    const tables = bySheet[nameM[1]];
+    if(!tables || !tables.length) continue;
+    let target = (relTarget[idM[1]] || '').replace(/^\//, '');
+    if(!target.startsWith('xl/')) target = 'xl/' + target.replace(/^\.\//, '');
+    if(!zip.file(target)) continue;
+    const dir = target.slice(0, target.lastIndexOf('/'));
+    const file = target.slice(target.lastIndexOf('/') + 1);
+    const relsPath = dir + '/_rels/' + file + '.rels';
+    let relsXml = zip.file(relsPath) ? await zip.file(relsPath).async('string') : null;
+    let sheetXml = await zip.file(target).async('string');
+    const existing = {};
+    if(relsXml){
+      for(const rm of relsXml.matchAll(/<Relationship[^>]*>/g)){
+        if(!/\/table"/.test(rm[0])) continue;
+        const ridM = /Id="([^"]+)"/.exec(rm[0]), tM = /Target="([^"]+)"/.exec(rm[0]);
+        if(ridM && tM){
+          let p = tM[1];
+          if(p.startsWith('../')) p = 'xl/' + p.slice(3);
+          existing[p] = ridM[1];
+        }
+      }
+    }
+    let relsChanged = false, nextRid = 900;
+    const wanted = [];
+    for(const t of tables){
+      let rid = existing[t.part];
+      if(!rid){
+        rid = 'rId' + (nextRid++);
+        const relEl = '<Relationship Id="' + rid + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../' + t.part.slice(3) + '"/>';
+        if(!relsXml) relsXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>';
+        relsXml = relsXml.replace('</Relationships>', relEl + '</Relationships>');
+        relsChanged = true;
+      }
+      wanted.push(rid);
+    }
+    if(relsChanged) zip.file(relsPath, relsXml);
+    const tp = '<tableParts count="' + wanted.length + '">' + wanted.map(r => '<tablePart r:id="' + r + '"/>').join('') + '</tableParts>';
+    if(/<tableParts[\s\S]*?<\/tableParts>/.test(sheetXml)) sheetXml = sheetXml.replace(/<tableParts[\s\S]*?<\/tableParts>/, tp);
+    else if(/<tableParts[^>]*\/>/.test(sheetXml)) sheetXml = sheetXml.replace(/<tableParts[^>]*\/>/, tp);
+    else sheetXml = sheetXml.replace('</worksheet>', tp + '</worksheet>');
+    zip.file(target, sheetXml);
+  }
+  let ctXml = await zip.file('[Content_Types].xml').async('string');
+  let ctChanged = false;
+  for(const t of origTables){
+    if(!ctXml.includes('PartName="/' + t.part + '"')){
+      ctXml = ctXml.replace('</Types>', '<Override PartName="/' + t.part + '" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml"/></Types>');
+      ctChanged = true;
+    }
+  }
+  if(ctChanged) zip.file('[Content_Types].xml', ctXml);
+  const buf = await zip.generateAsync({ type: 'arraybuffer', compression: 'DEFLATE' });
+  return { buf, restored };
+}
+
 function finishSheet(grid, ws){
   const model = C.buildSheetModel(grid);
   if(!model.sections.length){
@@ -1022,6 +1188,7 @@ function finishSheet(grid, ws){
 
 function handleSheetFile(file){
   relock();
+  state.origTables = [];
   $('sheet-picker').classList.add('hidden'); $('sheet-picker').innerHTML = '';
   state.sheetName = file.name;
   const isX = /\.(xlsx|xls)$/i.test(file.name);
@@ -1033,6 +1200,7 @@ function handleSheetFile(file){
       if(isX){
         const san = await sanitizeSharedFormulas(rd.result);
         state.sharedConverted = san.converted; state.sharedDropped = san.dropped;
+        try { state.origTables = await captureTables(san.buf); } catch(e){ state.origTables = []; }
         if(san.dropped) msg('upload-messages','warn','<strong>Heads up:</strong> ' + san.dropped + ' formula cell(s) in this workbook reference a shared formula that exists nowhere in the file, so they were kept as fixed values. Everything else was read normally.');
         const wb = new ExcelJS.Workbook();
         await wb.xlsx.load(san.buf);
@@ -1216,13 +1384,10 @@ function dateFieldHtml(currentDate){
 
 function renderMapping(){
   const section = state.sheetModel.sections[0];
+  // The columns are matched automatically from the suggested mapping;
+  // there is nothing to confirm here. The date for the newest Paid
+  // column (in the panel below) is the only thing to check.
   state.mapping = C.suggestMapping(section);
-  const cols = section.columns.filter(c => c.label);
-  const fields = [['original','PDF "Original Amount" updates'], ['approved','PDF "Approved Amount" updates'], ['revised','PDF "Revised Amount" updates']];
-  $('map-grid').innerHTML = fields.map(([f, label]) =>
-    '<div><label>' + label + '</label><select id="map-' + f + '">' +
-    cols.map(c => '<option value="' + c.idx + '"' + (state.mapping[f] === c.idx ? ' selected' : '') + '>' + esc(c.label) + '</option>').join('') +
-    '</select></div>').join('');
   const pc = state.mapping.paidCols || [];
   let html = '';
   if(pc.length >= 2){
@@ -1241,12 +1406,6 @@ function renderMapping(){
 }
 
 /* ---------- step 4: compare & review ---------- */
-
-function currentMapping(){
-  const m = Object.assign({}, state.mapping);
-  for(const f of ['original','approved','revised']) m[f] = +$('map-' + f).value;
-  return m;
-}
 
 function warningsHtml(cmp){
   let html = '';
@@ -1269,8 +1428,7 @@ function warningsHtml(cmp){
 }
 
 function renderReview(){
-  const m = currentMapping();
-  state.mapping = m;
+  const m = state.mapping;
   // Freeze the newest-Paid date NOW, validated and normalized, so what the
   // review shows is exactly what gets written at apply time.
   const dateInput = $('paid-date');
@@ -1614,10 +1772,66 @@ async function applyAndBuild(){
         }
       }
     }
+    // Refresh cached formula results from the post-edit values. A saved
+    // formula cell carries the result it had when the file was last
+    // calculated; viewers that do not recalculate (previews, SharePoint)
+    // would keep showing the OLD numbers in calculated columns like
+    // Amount Paid This Period. Recomputing the cache here makes the
+    // saved file show the new numbers everywhere, immediately.
+    const liveGrid = [];
+    for(let r = 1; r <= ws.rowCount; r++){
+      const row = [];
+      for(let c = 1; c <= ws.columnCount; c++){
+        const v = ws.getCell(r, c).value;
+        if(v === null || v === undefined) row.push('');
+        else if(typeof v === 'number') row.push(v);
+        else if(v instanceof Date) row.push('');
+        else if(typeof v === 'object') row.push(typeof v.result === 'number' ? v.result : '');
+        else row.push(v);
+      }
+      liveGrid.push(row);
+    }
+    let cachesRefreshed = 0;
+    const tryEvalCell = cell => {
+      const ev = evalSimple(cell.value.formula, liveGrid, 0);
+      if(ev === null) return false;
+      liveGrid[cell.row - 1][cell.col - 1] = ev;
+      if(cell.value.result !== ev){
+        cell.value = Object.assign({}, cell.value, { result: ev });
+        cachesRefreshed++;
+        return true;
+      }
+      return false;
+    };
+    for(let pass = 0; pass < 4; pass++){
+      let progress = false;
+      eachFormulaCell(cell => { if(!/^SUM\s*\(/i.test(cell.value.formula)) progress = tryEvalCell(cell) || progress; });
+      if(!progress) break;
+    }
+    eachFormulaCell(cell => { if(/^SUM\s*\(/i.test(cell.value.formula)) tryEvalCell(cell); });
+    state.cachesRefreshed = cachesRefreshed;
     try { if(!wb.calcProperties) wb.calcProperties = {}; wb.calcProperties.fullCalcOnLoad = true; } catch(e){}
     const buf = await wb.xlsx.writeBuffer();
+    // Put the workbook's Excel Tables back exactly as authored (the
+    // writer re-creates them with wrong ranges and headerRowCount="0",
+    // which is what made Excel show its repair prompt), adjusting the
+    // ranges for the row or column inserted above.
+    let finalBuf = buf;
+    state.tablesRestored = 0; state.tablesRestoreFailed = false;
+    if(state.origTables && state.origTables.length){
+      try {
+        const delta = {
+          rowAt1: rowInsertAt >= 0 ? rowInsertAt + 1 : null,
+          rowCount: acceptedAdds.length,
+          colAt1: colInserted ? colInsertAt + 1 : null,
+          newColName: state.newPaidDate || 'Paid'
+        };
+        const rt = await restoreTables(buf, state.origTables, state.sheetTab, delta);
+        finalBuf = rt.buf; state.tablesRestored = rt.restored;
+      } catch(e){ state.tablesRestoreFailed = true; }
+    }
     outName = base + '_updated.xlsx';
-    blob = new Blob([buf], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+    blob = new Blob([finalBuf], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
   } else {
     outName = base + '_updated.csv';
     blob = new Blob(['\ufeff' + C.serializeCSV(res.grid)], {type:'text/csv;charset=utf-8'});
@@ -1656,6 +1870,11 @@ async function applyAndBuild(){
   let html = '<div class="note ok"><strong>Updated file built.</strong> ' + acceptedUpdates.length + ' amount update(s), ' +
     acceptedRolls.length + ' Paid roll(s) and ' + acceptedAdds.length + ' new row(s) were applied to a copy of your file. Your original file was not touched.</div>' +
     (state.isXlsx ? '<div class="note info">Your workbook was edited in place: it keeps its sheets, sheet names, formatting and layout. Only the first table on the "' + esc(state.sheetTab) + '" tab changed, plus any new row. The second table and every other tab are untouched.</div>' : '');
+  if(state.tablesRestoreFailed) html += '<div class="note warn"><strong>Table warning:</strong> your workbook contains Excel tables and their definitions could not be carried over cleanly. If Excel offers to repair the file when you open it, send me the file and I will sort it out.</div>';
+  else if(state.tablesRestored) html += '<div class="note info">Your workbook\'s Excel tables (the filtered lists with totals rows) were preserved exactly as they were, with their ranges adjusted for the new row.</div>';
+  if(state.cachesRefreshed){
+    html += '<div class="note info">The calculated columns in the saved file were refreshed with the new numbers (' + state.cachesRefreshed + ' cells), so Amount Paid This Period, Balance to Finish and the totals already show the updated values when you open it, without waiting for Excel to recalculate.</div>';
+  }
   if(state.sharedConverted){
     html += '<div class="note info">This workbook stored its filled-down formulas as shared formulas, which cannot survive inserting a row. They were converted to ordinary formulas with the same calculations (' + state.sharedConverted + ' cells), so every calculated column still works exactly as before.</div>';
   }
