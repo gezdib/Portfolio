@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Subcontract Log Updater</title>
+<title>Subcontractor Log Updater</title>
 <style>
   :root{
     --ink:#1a2332; --muted:#5b6b82; --line:#d7dee8; --bg:#f4f6f9; --card:#ffffff;
@@ -1606,26 +1606,6 @@ async function applyAndBuild(){
     const numToCol = n => { let s = ''; while(n > 0){ const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); } return s; };
     const translateFormulaCols = (f, fromCol, delta) => String(f).replace(/(^|[^A-Za-z0-9_.])(\$?)([A-Za-z]{1,3})(\$?)(\d+)/g,
       (m0, pre, ca, col, ra, row) => pre + ca + (ca === '$' ? col : numToCol(colToNum(col) + (colToNum(col) >= fromCol ? delta : 0))) + ra + row);
-    const evalSimple = (formula, grid, shift) => {
-      const cellVal = (colLetters, rowNum) => {
-        const row = grid[rowNum - 1 - shift]; if(!row) return 0;
-        const v = row[colToNum(colLetters) - 1];
-        if(typeof v === 'number') return v;
-        const cc = C.parseAmountToCents(v); return cc === null ? 0 : cc / 100;
-      };
-      let mm = /^([A-Z]+)(\d+)\s*([+\-])\s*([A-Z]+)(\d+)$/.exec(formula);
-      if(mm){
-        const a = cellVal(mm[1], +mm[2]), b = cellVal(mm[4], +mm[5]);
-        return Math.round((mm[3] === '+' ? a + b : a - b) * 100) / 100;
-      }
-      mm = /^SUM\(([A-Z]+)(\d+):([A-Z]+)(\d+)\)$/i.exec(formula);
-      if(mm){
-        let s = 0;
-        for(let r = +mm[2]; r <= +mm[4]; r++) s += cellVal(mm[1], r);
-        return Math.round(s * 100) / 100;
-      }
-      return null;
-    };
     const eachFormulaCell = fn => {
       ws.eachRow({ includeEmpty: false }, row => {
         row.eachCell({ includeEmpty: false }, cell => { if(isFormulaCell(cell) && cell.value.formula !== undefined) fn(cell); });
@@ -1666,15 +1646,9 @@ async function applyAndBuild(){
           const src = ws.getCell(rowInsertAt, c);
           const dst = ws.getCell(rowInsertAt + 1 + k, c);
           if(src.value && src.value.formula !== undefined){
-            const nv = { formula: translateFormulaRows(src.value.formula, rowInsertAt, k + 1) };
-            const gv = outGrid[rowInsertAt + k] ? outGrid[rowInsertAt + k][c - 1] : null;
-            const gc = typeof gv === 'number' ? gv : (typeof gv === 'string' ? C.parseAmountToCents(gv) : null);
-            if(gc !== null && gc !== undefined) nv.result = typeof gv === 'number' ? gv : gc / 100;
-            else {
-              const ev = evalSimple(nv.formula, outGrid, 0);
-              if(ev !== null) nv.result = ev;
-            }
-            dst.value = nv;
+            // Only the formula is copied, never a computed result: the
+            // workbook calculates the new row itself when it is opened.
+            dst.value = { formula: translateFormulaRows(src.value.formula, rowInsertAt, k + 1) };
           } else if(src.value && src.value.sharedFormula !== undefined){
             sharedFormulaNote = true;
           }
@@ -1698,33 +1672,16 @@ async function applyAndBuild(){
         }
       });
     }
-    // ExcelJS drops the cached result of some formula cells (notably
-    // results of exactly 0) when cells are moved or rewritten. Restore
-    // any missing cached result from the original file's own values, so
-    // the saved workbook's numbers are complete even before Excel
-    // recalculates it.
-    eachFormulaCell(cell => {
-      if(cell.value.result !== undefined) return;
-      let oR = cell.row, oC = cell.col;
-      if(rowInsertAt >= 0){
-        if(oR >= rowInsertAt + 1 && oR < rowInsertAt + 1 + acceptedAdds.length) return; // an inserted row
-        if(oR >= rowInsertAt + 1 + acceptedAdds.length) oR -= acceptedAdds.length;
-      }
-      if(colInserted){
-        if(oC === colInsertAt + 1) return; // the inserted column
-        if(oC > colInsertAt + 1) oC -= 1;
-      }
-      const gv = origGrid[oR - 1] ? origGrid[oR - 1][oC - 1] : null;
-      const gc = typeof gv === 'number' ? gv : (typeof gv === 'string' ? C.parseAmountToCents(gv) : null);
-      if(gc !== null && gc !== undefined) cell.value = Object.assign({}, cell.value, { result: typeof gv === 'number' ? gv : gc / 100 });
-      else {
-        const moved = rowInsertAt >= 0 && cell.row >= rowInsertAt + 1 + acceptedAdds.length;
-        const ev = evalSimple(cell.value.formula, origGrid, moved ? acceptedAdds.length : 0);
-        if(ev !== null) cell.value = Object.assign({}, cell.value, { result: ev });
-      }
-    });
+    // The user's rule: the tool writes INPUTS only. The calculated
+    // columns (Amount Paid This Period, Balance to Finish) and the
+    // totals row are never written at all, not even when they hold plain
+    // values: the workbook's own formulas own them, and Excel
+    // recalculates on open (fullCalcOnLoad is set below).
+    const totalsRowOut = section.totalsRowIdx + (rowInsertAt >= 0 && section.totalsRowIdx >= rowInsertAt ? acceptedAdds.length : 0);
+    const tpOut = outColOf(m.thisPeriod), balOut = outColOf(m.balance);
     for(let r = 0; r < outGrid.length; r++){
       for(let c = 0; c < outGrid[r].length; c++){
+        if(r === totalsRowOut || c === tpOut || c === balOut) continue;
         let or = r, oc = c;
         if(rowInsertAt >= 0){
           if(r >= rowInsertAt && r < rowInsertAt + acceptedAdds.length) continue;
@@ -1743,7 +1700,6 @@ async function applyAndBuild(){
           // never overwritten. Excel recalculates them from the updated
           // Paid columns when the file is opened.
           let label = 'column ' + (c + 1);
-          const totalsRowOut = section.totalsRowIdx + (rowInsertAt >= 0 && section.totalsRowIdx >= rowInsertAt ? acceptedAdds.length : 0);
           if(r === totalsRowOut) label = 'Totals row';
           else if(r === section.headerRowIdx - 2) label = 'Paid date header';
           else if(c === paidLeftOut) label = 'Paid (newest)';
@@ -1772,44 +1728,6 @@ async function applyAndBuild(){
         }
       }
     }
-    // Refresh cached formula results from the post-edit values. A saved
-    // formula cell carries the result it had when the file was last
-    // calculated; viewers that do not recalculate (previews, SharePoint)
-    // would keep showing the OLD numbers in calculated columns like
-    // Amount Paid This Period. Recomputing the cache here makes the
-    // saved file show the new numbers everywhere, immediately.
-    const liveGrid = [];
-    for(let r = 1; r <= ws.rowCount; r++){
-      const row = [];
-      for(let c = 1; c <= ws.columnCount; c++){
-        const v = ws.getCell(r, c).value;
-        if(v === null || v === undefined) row.push('');
-        else if(typeof v === 'number') row.push(v);
-        else if(v instanceof Date) row.push('');
-        else if(typeof v === 'object') row.push(typeof v.result === 'number' ? v.result : '');
-        else row.push(v);
-      }
-      liveGrid.push(row);
-    }
-    let cachesRefreshed = 0;
-    const tryEvalCell = cell => {
-      const ev = evalSimple(cell.value.formula, liveGrid, 0);
-      if(ev === null) return false;
-      liveGrid[cell.row - 1][cell.col - 1] = ev;
-      if(cell.value.result !== ev){
-        cell.value = Object.assign({}, cell.value, { result: ev });
-        cachesRefreshed++;
-        return true;
-      }
-      return false;
-    };
-    for(let pass = 0; pass < 4; pass++){
-      let progress = false;
-      eachFormulaCell(cell => { if(!/^SUM\s*\(/i.test(cell.value.formula)) progress = tryEvalCell(cell) || progress; });
-      if(!progress) break;
-    }
-    eachFormulaCell(cell => { if(/^SUM\s*\(/i.test(cell.value.formula)) tryEvalCell(cell); });
-    state.cachesRefreshed = cachesRefreshed;
     try { if(!wb.calcProperties) wb.calcProperties = {}; wb.calcProperties.fullCalcOnLoad = true; } catch(e){}
     const buf = await wb.xlsx.writeBuffer();
     // Put the workbook's Excel Tables back exactly as authored (the
@@ -1848,10 +1766,14 @@ async function applyAndBuild(){
     'Newest ' + C.formatCentsPlain(r.pdfPaid) + ', prior ' + C.formatCentsPlain(r.oldLeft) + ', paid this month ' + C.formatCentsPlain(r.pdfPaid - (r.oldLeft || 0))]);
   for(const a of acceptedAdds) rep.push(['New row', a.code, a.subcontractor + ' / ' + a.description, '', 'Original ' + C.formatCentsPlain(a.amounts.original) + ', Revised ' + C.formatCentsPlain(a.amounts.revised) + ', Paid ' + C.formatCentsPlain(a.amounts.paid)]);
   const roleLabel = { original:'Original', approved:'Approved', revised:'Revised', paidLeft:'Paid (newest)', paidRight:'Paid (prior)', thisPeriod:'Amount Paid This Period', balance:'Balance to Finish' };
-  for(const d of res.derivedChanges){
-    if(d.kind === 'balance') rep.push(['Recalculated', d.code, 'Balance to Finish (Revised - Paid)', C.formatCentsPlain(d.oldCents), C.formatCentsPlain(d.newCents)]);
-    else if(d.kind === 'thisperiod') rep.push(['Recalculated', d.code, 'Amount Paid This Period (newest Paid - prior Paid)', C.formatCentsPlain(d.oldCents), C.formatCentsPlain(d.newCents)]);
-    else rep.push(['Recalculated', '', 'Totals row, ' + (roleLabel[d.role] || ('column ' + (d.colIdx + 1))), C.formatCentsPlain(d.oldCents), C.formatCentsPlain(d.newCents)]);
+  if(!state.isXlsx){
+    for(const d of res.derivedChanges){
+      if(d.kind === 'balance') rep.push(['Recalculated', d.code, 'Balance to Finish (Revised - Paid)', C.formatCentsPlain(d.oldCents), C.formatCentsPlain(d.newCents)]);
+      else if(d.kind === 'thisperiod') rep.push(['Recalculated', d.code, 'Amount Paid This Period (newest Paid - prior Paid)', C.formatCentsPlain(d.oldCents), C.formatCentsPlain(d.newCents)]);
+      else rep.push(['Recalculated', '', 'Totals row, ' + (roleLabel[d.role] || ('column ' + (d.colIdx + 1))), C.formatCentsPlain(d.oldCents), C.formatCentsPlain(d.newCents)]);
+    }
+  } else if(res.derivedChanges.length){
+    rep.push(['Note', '', 'Calculated columns (Amount Paid This Period, Balance to Finish, totals) were NOT written by the tool. The workbook\'s own formulas calculate them when the file is opened in Excel.', '', '']);
   }
   for(const s of formulaSkips) rep.push(['Formula left alone', s.code, s.label, '', 'Formula in your workbook, not overwritten. It recalculates in Excel.']);
   if(totalsExtended) rep.push(['Formula extended', '', 'Totals row', '', 'SUM range(s) extended so the new row(s) are included in the totals.']);
@@ -1872,8 +1794,8 @@ async function applyAndBuild(){
     (state.isXlsx ? '<div class="note info">Your workbook was edited in place: it keeps its sheets, sheet names, formatting and layout. Only the first table on the "' + esc(state.sheetTab) + '" tab changed, plus any new row. The second table and every other tab are untouched.</div>' : '');
   if(state.tablesRestoreFailed) html += '<div class="note warn"><strong>Table warning:</strong> your workbook contains Excel tables and their definitions could not be carried over cleanly. If Excel offers to repair the file when you open it, send me the file and I will sort it out.</div>';
   else if(state.tablesRestored) html += '<div class="note info">Your workbook\'s Excel tables (the filtered lists with totals rows) were preserved exactly as they were, with their ranges adjusted for the new row.</div>';
-  if(state.cachesRefreshed){
-    html += '<div class="note info">The calculated columns in the saved file were refreshed with the new numbers (' + state.cachesRefreshed + ' cells), so Amount Paid This Period, Balance to Finish and the totals already show the updated values when you open it, without waiting for Excel to recalculate.</div>';
+  if(state.isXlsx){
+    html += '<div class="note info"><strong>The tool did not calculate anything.</strong> It only wrote the new input amounts (Original, Approved, Revised where they are plain values, and the Paid columns), the Paid dates, and the new row. Amount Paid This Period, Balance to Finish and the totals are worked out by your workbook\'s own formulas when you open the file in Excel, and the file is set to recalculate on open.</div>';
   }
   if(state.sharedConverted){
     html += '<div class="note info">This workbook stored its filled-down formulas as shared formulas, which cannot survive inserting a row. They were converted to ordinary formulas with the same calculations (' + state.sharedConverted + ' cells), so every calculated column still works exactly as before.</div>';
@@ -1882,12 +1804,12 @@ async function applyAndBuild(){
     html += '<div class="note warn"><strong>Heads up:</strong> ' + paidFormulaSkips.length + ' Paid cell(s) in your workbook contain formulas, so they were NOT overwritten (' +
       paidFormulaSkips.map(s => esc(s.code || s.label)).join(', ') + '). Everything else was applied.</div>';
   } else if(formulaSkips.length){
-    html += '<div class="note info"><strong>Formula cells left alone:</strong> ' + formulaSkips.length + ' cell(s) in your workbook are formulas (calculated columns like Revised, Amount Paid This Period, Balance to Finish and the totals). They were not overwritten. Excel recalculates them from the updated Paid columns when you open the file.</div>';
+    html += '<div class="note info"><strong>Formula cells left alone:</strong> ' + formulaSkips.length + ' cell(s) in the columns being updated contain formulas (for example a Revised cell that adds Original and Approved). They were not overwritten. Excel recalculates them from the updated amounts when you open the file.</div>';
   }
   if(totalsExtended) html += '<div class="note info">The totals row SUM ranges were extended so the new row is included in the totals.</div>';
   if(sharedFormulaNote) html += '<div class="note warn">One calculated column on the new row uses a shared formula that could not be copied automatically. If that column looks blank on the new row, drag the formula down from the row above in Excel.</div>';
   for(const n of res.notes) html += '<div class="note info">' + esc(n) + '</div>';
-  if(res.derivedChanges.length){
+  if(!state.isXlsx && res.derivedChanges.length){
     html += '<div class="note info"><strong>Also recalculated, so the file stays internally consistent:</strong><ul style="margin:6px 0 0;padding-left:18px">' +
       res.derivedChanges.map(d => {
         if(d.kind === 'balance') return '<li>' + esc(d.code) + ': Balance to Finish ' + C.formatCentsPlain(d.oldCents) + ' &rarr; ' + C.formatCentsPlain(d.newCents) + '</li>';
