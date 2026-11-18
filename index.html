@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Subcontract Log Update</title>
+<title>Subcontractor Log Updater</title>
 <style>
   :root{
     --ink:#1a2332; --muted:#5b6b82; --line:#d7dee8; --bg:#f4f6f9; --card:#ffffff;
@@ -160,6 +160,7 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script>
 /* Subcontract Log Updater - core logic.
    Pure functions, no DOM. Works in the browser (window.SLUCore) and in Node (module.exports).
@@ -907,7 +908,7 @@
 const C = window.SLUCore;
 const $ = id => document.getElementById(id);
 const state = {
-  sheetName:'', sheetTab:'', sheetGrid:null, sheetModel:null, isXlsx:false,
+  sheetName:'', sheetTab:'', sheetGrid:null, sheetModel:null, isXlsx:false, sharedConverted:0, sharedDropped:0,
   pdfName:'', pdfRows:[], pdfTotals:null, pdfWarnings:[], pdfLogDate:'',
   mapping:null, cmp:null
 };
@@ -946,6 +947,60 @@ function cellToGridValue(cell){
   return v;
 }
 
+const colToNumT = col => { let n = 0; for(const ch of col.toUpperCase()) n = n * 26 + (ch.charCodeAt(0) - 64); return n; };
+const numToColT = n => { let s = ''; while(n > 0){ const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); } return s; };
+const translateFormulaDH = (f, dRow, dCol) => String(f).replace(/(^|[^A-Za-z0-9_.])(\$?)([A-Za-z]{1,3})(\$?)(\d+)/g,
+  (m0, pre, ca, col, ra, row) => {
+    const nc = ca === '$' || dCol === 0 ? col : numToColT(colToNumT(col) + dCol);
+    const nr = ra === '$' ? row : String(+row + dRow);
+    return pre + ca + nc + ra + nr;
+  });
+
+async function sanitizeSharedFormulas(buf){
+  if(typeof JSZip === 'undefined') return { buf, converted: 0, dropped: 0 };
+  let zip;
+  try { zip = await JSZip.loadAsync(buf); } catch(e){ return { buf, converted: 0, dropped: 0 }; }
+  const paths = Object.keys(zip.files).filter(p => /^xl\/worksheets\/sheet\d+\.xml$/.test(p));
+  let converted = 0, dropped = 0, touched = false;
+  for(const path of paths){
+    const xml = await zip.file(path).async('string');
+    if(xml.indexOf('t="shared"') < 0) continue;
+    const doc = new DOMParser().parseFromString(xml, 'text/xml');
+    const fEls = Array.from(doc.getElementsByTagName('f'));
+    const addrOf = cEl => {
+      const mm = /^([A-Z]+)(\d+)$/.exec((cEl && cEl.getAttribute('r')) || '');
+      return mm ? { col: colToNumT(mm[1]), row: +mm[2] } : null;
+    };
+    const masters = {};
+    for(const f of fEls){
+      if(f.getAttribute('t') !== 'shared') continue;
+      if(f.textContent){
+        const a = addrOf(f.parentNode);
+        if(a) masters[f.getAttribute('si')] = { formula: f.textContent, row: a.row, col: a.col };
+      }
+    }
+    for(const f of fEls){
+      if(f.getAttribute('t') !== 'shared') continue;
+      const si = f.getAttribute('si'), text = f.textContent, a = addrOf(f.parentNode);
+      f.removeAttribute('t'); f.removeAttribute('si'); f.removeAttribute('ref');
+      if(text){ converted++; }
+      else if(a && masters[si]){
+        f.textContent = translateFormulaDH(masters[si].formula, a.row - masters[si].row, a.col - masters[si].col);
+        converted++;
+      } else if(f.parentNode){
+        // A clone whose master formula exists nowhere: keep the cached
+        // value the file already carries and drop the broken formula.
+        f.parentNode.removeChild(f); dropped++;
+      }
+    }
+    zip.file(path, new XMLSerializer().serializeToString(doc));
+    touched = true;
+  }
+  if(!touched) return { buf, converted: 0, dropped: 0 };
+  const out = await zip.generateAsync({ type: 'arraybuffer', compression: 'DEFLATE' });
+  return { buf: out, converted, dropped };
+}
+
 function finishSheet(grid, ws){
   const model = C.buildSheetModel(grid);
   if(!model.sections.length){
@@ -976,8 +1031,11 @@ function handleSheetFile(file){
     try{
       let grid;
       if(isX){
+        const san = await sanitizeSharedFormulas(rd.result);
+        state.sharedConverted = san.converted; state.sharedDropped = san.dropped;
+        if(san.dropped) msg('upload-messages','warn','<strong>Heads up:</strong> ' + san.dropped + ' formula cell(s) in this workbook reference a shared formula that exists nowhere in the file, so they were kept as fixed values. Everything else was read normally.');
         const wb = new ExcelJS.Workbook();
-        await wb.xlsx.load(rd.result);
+        await wb.xlsx.load(san.buf);
         // Some workbooks carry broken document dates that make writers fail;
         // refresh them so the file can always be written back.
         try { wb.created = new Date(); wb.modified = new Date(); } catch(e){}
@@ -1302,7 +1360,13 @@ function renderReview(){
   }
   html += '<div class="btnrow"><button class="btn" id="btn-apply">Apply the ticked changes and build the updated file</button></div>';
   $('review-body').innerHTML = html;
-  $('btn-apply').addEventListener('click', applyAndBuild);
+  $('btn-apply').addEventListener('click', () => {
+    applyAndBuild().catch(e => {
+      $('result-body').innerHTML = '<div class="note bad"><strong>Something went wrong while building the updated file:</strong> ' + esc((e && e.message) || e) +
+        '<br>No file was produced and your original is untouched. Send Muse this message together with the contracts file and it will be fixed.</div>';
+      unlock('card-result');
+    });
+  });
   unlock('card-review');
 }
 
@@ -1384,6 +1448,26 @@ async function applyAndBuild(){
     const numToCol = n => { let s = ''; while(n > 0){ const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); } return s; };
     const translateFormulaCols = (f, fromCol, delta) => String(f).replace(/(^|[^A-Za-z0-9_.])(\$?)([A-Za-z]{1,3})(\$?)(\d+)/g,
       (m0, pre, ca, col, ra, row) => pre + ca + (ca === '$' ? col : numToCol(colToNum(col) + (colToNum(col) >= fromCol ? delta : 0))) + ra + row);
+    const evalSimple = (formula, grid, shift) => {
+      const cellVal = (colLetters, rowNum) => {
+        const row = grid[rowNum - 1 - shift]; if(!row) return 0;
+        const v = row[colToNum(colLetters) - 1];
+        if(typeof v === 'number') return v;
+        const cc = C.parseAmountToCents(v); return cc === null ? 0 : cc / 100;
+      };
+      let mm = /^([A-Z]+)(\d+)\s*([+\-])\s*([A-Z]+)(\d+)$/.exec(formula);
+      if(mm){
+        const a = cellVal(mm[1], +mm[2]), b = cellVal(mm[4], +mm[5]);
+        return Math.round((mm[3] === '+' ? a + b : a - b) * 100) / 100;
+      }
+      mm = /^SUM\(([A-Z]+)(\d+):([A-Z]+)(\d+)\)$/i.exec(formula);
+      if(mm){
+        let s = 0;
+        for(let r = +mm[2]; r <= +mm[4]; r++) s += cellVal(mm[1], r);
+        return Math.round(s * 100) / 100;
+      }
+      return null;
+    };
     const eachFormulaCell = fn => {
       ws.eachRow({ includeEmpty: false }, row => {
         row.eachCell({ includeEmpty: false }, cell => { if(isFormulaCell(cell) && cell.value.formula !== undefined) fn(cell); });
@@ -1424,7 +1508,15 @@ async function applyAndBuild(){
           const src = ws.getCell(rowInsertAt, c);
           const dst = ws.getCell(rowInsertAt + 1 + k, c);
           if(src.value && src.value.formula !== undefined){
-            dst.value = { formula: translateFormulaRows(src.value.formula, rowInsertAt, k + 1) };
+            const nv = { formula: translateFormulaRows(src.value.formula, rowInsertAt, k + 1) };
+            const gv = outGrid[rowInsertAt + k] ? outGrid[rowInsertAt + k][c - 1] : null;
+            const gc = typeof gv === 'number' ? gv : (typeof gv === 'string' ? C.parseAmountToCents(gv) : null);
+            if(gc !== null && gc !== undefined) nv.result = typeof gv === 'number' ? gv : gc / 100;
+            else {
+              const ev = evalSimple(nv.formula, outGrid, 0);
+              if(ev !== null) nv.result = ev;
+            }
+            dst.value = nv;
           } else if(src.value && src.value.sharedFormula !== undefined){
             sharedFormulaNote = true;
           }
@@ -1448,6 +1540,31 @@ async function applyAndBuild(){
         }
       });
     }
+    // ExcelJS drops the cached result of some formula cells (notably
+    // results of exactly 0) when cells are moved or rewritten. Restore
+    // any missing cached result from the original file's own values, so
+    // the saved workbook's numbers are complete even before Excel
+    // recalculates it.
+    eachFormulaCell(cell => {
+      if(cell.value.result !== undefined) return;
+      let oR = cell.row, oC = cell.col;
+      if(rowInsertAt >= 0){
+        if(oR >= rowInsertAt + 1 && oR < rowInsertAt + 1 + acceptedAdds.length) return; // an inserted row
+        if(oR >= rowInsertAt + 1 + acceptedAdds.length) oR -= acceptedAdds.length;
+      }
+      if(colInserted){
+        if(oC === colInsertAt + 1) return; // the inserted column
+        if(oC > colInsertAt + 1) oC -= 1;
+      }
+      const gv = origGrid[oR - 1] ? origGrid[oR - 1][oC - 1] : null;
+      const gc = typeof gv === 'number' ? gv : (typeof gv === 'string' ? C.parseAmountToCents(gv) : null);
+      if(gc !== null && gc !== undefined) cell.value = Object.assign({}, cell.value, { result: typeof gv === 'number' ? gv : gc / 100 });
+      else {
+        const moved = rowInsertAt >= 0 && cell.row >= rowInsertAt + 1 + acceptedAdds.length;
+        const ev = evalSimple(cell.value.formula, origGrid, moved ? acceptedAdds.length : 0);
+        if(ev !== null) cell.value = Object.assign({}, cell.value, { result: ev });
+      }
+    });
     for(let r = 0; r < outGrid.length; r++){
       for(let c = 0; c < outGrid[r].length; c++){
         let or = r, oc = c;
@@ -1539,6 +1656,9 @@ async function applyAndBuild(){
   let html = '<div class="note ok"><strong>Updated file built.</strong> ' + acceptedUpdates.length + ' amount update(s), ' +
     acceptedRolls.length + ' Paid roll(s) and ' + acceptedAdds.length + ' new row(s) were applied to a copy of your file. Your original file was not touched.</div>' +
     (state.isXlsx ? '<div class="note info">Your workbook was edited in place: it keeps its sheets, sheet names, formatting and layout. Only the first table on the "' + esc(state.sheetTab) + '" tab changed, plus any new row. The second table and every other tab are untouched.</div>' : '');
+  if(state.sharedConverted){
+    html += '<div class="note info">This workbook stored its filled-down formulas as shared formulas, which cannot survive inserting a row. They were converted to ordinary formulas with the same calculations (' + state.sharedConverted + ' cells), so every calculated column still works exactly as before.</div>';
+  }
   if(paidFormulaSkips.length){
     html += '<div class="note warn"><strong>Heads up:</strong> ' + paidFormulaSkips.length + ' Paid cell(s) in your workbook contain formulas, so they were NOT overwritten (' +
       paidFormulaSkips.map(s => esc(s.code || s.label)).join(', ') + '). Everything else was applied.</div>';
