@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Subcontract Log Updater</title>
+<title>Subcontract Log Update</title>
 <style>
   :root{
     --ink:#1a2332; --muted:#5b6b82; --line:#d7dee8; --bg:#f4f6f9; --card:#ffffff;
@@ -96,6 +96,7 @@
         <div class="small">Excel or CSV, for example the MDOT Tracking Log (.xlsx, .xls, .csv)</div>
         <input type="file" id="file-sheet" accept=".csv,.xlsx,.xls">
         <div class="fileok hidden" id="sheet-ok"></div>
+        <div id="sheet-picker" class="hidden" style="margin-top:10px;text-align:left"></div>
       </div>
       <div class="drop" id="drop-pdf">
         <div class="big">Subcontract Log PDF (newest data)</div>
@@ -906,7 +907,7 @@
 const C = window.SLUCore;
 const $ = id => document.getElementById(id);
 const state = {
-  sheetName:'', sheetGrid:null, sheetModel:null, isXlsx:false,
+  sheetName:'', sheetTab:'', sheetGrid:null, sheetModel:null, isXlsx:false,
   pdfName:'', pdfRows:[], pdfTotals:null, pdfWarnings:[], pdfLogDate:'',
   mapping:null, cmp:null
 };
@@ -945,8 +946,28 @@ function cellToGridValue(cell){
   return v;
 }
 
+function finishSheet(grid, ws){
+  const model = C.buildSheetModel(grid);
+  if(!model.sections.length){
+    msg('upload-messages','bad','<strong>No contract table found' + (ws ? ' on the tab "' + esc(ws.name) + '"' : ' in that file') + '.</strong> The tool looks for a header row containing "Contract #" and "Subcontractor". Check the file and try again. Any file you loaded before is still in place.');
+    return;
+  }
+  if(ws) state.worksheet = ws;
+  state.sheetTab = ws ? ws.name : '';
+  state.sheetGrid = grid;
+  state.sheetModel = model;
+  const s1 = model.sections[0];
+  const later = model.sections.slice(1).reduce((a, s) => a + s.dataRows.length, 0);
+  $('sheet-ok').textContent = 'Loaded: ' + state.sheetName + (ws ? ' — tab "' + ws.name + '"' : '') +
+    ' — ' + s1.dataRows.length + ' contract rows in the first table' +
+    (later ? '. The second table (' + later + ' rows) is never changed.' : '.');
+  $('sheet-ok').classList.remove('hidden');
+  maybeReady();
+}
+
 function handleSheetFile(file){
   relock();
+  $('sheet-picker').classList.add('hidden'); $('sheet-picker').innerHTML = '';
   state.sheetName = file.name;
   const isX = /\.(xlsx|xls)$/i.test(file.name);
   state.isXlsx = isX;
@@ -960,14 +981,44 @@ function handleSheetFile(file){
         // Some workbooks carry broken document dates that make writers fail;
         // refresh them so the file can always be written back.
         try { wb.created = new Date(); wb.modified = new Date(); } catch(e){}
-        const ws = wb.worksheets[0];
-        state.workbook = wb; state.worksheet = ws;
-        grid = [];
-        for(let r = 1; r <= ws.rowCount; r++){
-          const row = [];
-          for(let c = 1; c <= ws.columnCount; c++) row.push(cellToGridValue(ws.getCell(r, c)));
-          grid.push(row);
+        state.workbook = wb;
+        const gridOf = wsx => {
+          const g = [];
+          for(let r = 1; r <= wsx.rowCount; r++){
+            const row = [];
+            for(let c = 1; c <= wsx.columnCount; c++) row.push(cellToGridValue(wsx.getCell(r, c)));
+            g.push(row);
+          }
+          return g;
+        };
+        // Work on the "Paid to date" tab, never just the first tab: prefer
+        // a tab whose name says Paid; otherwise the one tab that holds a
+        // contract table; otherwise ask the user which tab.
+        const sheets = wb.worksheets;
+        let chosen = null;
+        if(sheets.length === 1) chosen = sheets[0];
+        else {
+          const paidNamed = sheets.filter(s => /paid/i.test(s.name));
+          if(paidNamed.length === 1) chosen = paidNamed[0];
+          else {
+            const withTable = sheets.filter(s => C.buildSheetModel(gridOf(s)).sections.length > 0);
+            if(withTable.length === 1) chosen = withTable[0];
+          }
         }
+        if(!chosen){
+          const pk = $('sheet-picker');
+          pk.innerHTML = '<div style="font-weight:600;margin-bottom:6px">This workbook has more than one tab. Which tab holds the subcontract log?</div>' +
+            sheets.map((s, i) => '<button type="button" class="btn secondary" data-sheet="' + i + '" style="margin:0 6px 6px 0">' + esc(s.name) + '</button>').join('');
+          pk.classList.remove('hidden');
+          pk.querySelectorAll('[data-sheet]').forEach(b => b.addEventListener('click', () => {
+            pk.classList.add('hidden');
+            const wsx = sheets[+b.getAttribute('data-sheet')];
+            finishSheet(gridOf(wsx), wsx);
+          }));
+          return;
+        }
+        state.worksheet = chosen;
+        grid = gridOf(chosen);
       } else {
         state.workbook = null; state.worksheet = null;
         let text;
@@ -975,18 +1026,7 @@ function handleSheetFile(file){
         catch(e) { text = new TextDecoder('windows-1252').decode(rd.result); }
         grid = C.parseCSV(text);
       }
-      const model = C.buildSheetModel(grid);
-      if(!model.sections.length){
-        msg('upload-messages','bad','<strong>No contract table found in that file.</strong> The tool looks for a header row containing "Contract #" and "Subcontractor". Check the file and try again. Any file you loaded before is still in place.');
-        return;
-      }
-      state.sheetGrid = grid;
-      state.sheetModel = model;
-      const s1 = state.sheetModel.sections[0];
-      $('sheet-ok').textContent = 'Loaded: ' + file.name + ' — ' + s1.dataRows.length + ' contract rows in the main section' +
-        (state.sheetModel.sections.length > 1 ? ', ' + state.sheetModel.sections.slice(1).reduce((a,s)=>a+s.dataRows.length,0) + ' more in later sections' : '');
-      $('sheet-ok').classList.remove('hidden');
-      maybeReady();
+      finishSheet(grid, state.worksheet);
     }catch(e){
       msg('upload-messages','bad','<strong>Could not read that file.</strong> ' + esc(e.message||e));
     }
@@ -1468,7 +1508,7 @@ async function applyAndBuild(){
 
   // Change report (CSV)
   const rep = [['Subcontract Log Updater - change report'],
-    ['Contracts file', state.sheetName], ['PDF log', state.pdfName || '(sample data)'],
+    ['Contracts file', state.sheetName], ['Tab', state.isXlsx ? state.sheetTab : '(csv)'], ['PDF log', state.pdfName || '(sample data)'],
     ['Generated', new Date().toLocaleString()], [],
     ['Type','Contract','Field / detail','Old value','New value']];
   for(const u of acceptedUpdates) rep.push(['Update', u.code, FIELD_LABEL[u.field], u.oldBlank ? '(blank)' : C.formatCentsPlain(u.oldCents), C.formatCentsPlain(u.newCents)]);
@@ -1498,7 +1538,7 @@ async function applyAndBuild(){
 
   let html = '<div class="note ok"><strong>Updated file built.</strong> ' + acceptedUpdates.length + ' amount update(s), ' +
     acceptedRolls.length + ' Paid roll(s) and ' + acceptedAdds.length + ' new row(s) were applied to a copy of your file. Your original file was not touched.</div>' +
-    (state.isXlsx ? '<div class="note info">Your workbook was edited in place: it keeps its sheets, sheet names, formatting and layout. Only the reviewed cells changed, plus any new row or column.</div>' : '');
+    (state.isXlsx ? '<div class="note info">Your workbook was edited in place: it keeps its sheets, sheet names, formatting and layout. Only the first table on the "' + esc(state.sheetTab) + '" tab changed, plus any new row. The second table and every other tab are untouched.</div>' : '');
   if(paidFormulaSkips.length){
     html += '<div class="note warn"><strong>Heads up:</strong> ' + paidFormulaSkips.length + ' Paid cell(s) in your workbook contain formulas, so they were NOT overwritten (' +
       paidFormulaSkips.map(s => esc(s.code || s.label)).join(', ') + '). Everything else was applied.</div>';
