@@ -76,9 +76,10 @@
   <div class="wrap">
     <h1>Subcontract Log Updater</h1>
     <p>Upload the current contracts file (the MDOT tracking log) and the newest Subcontract Log PDF.
-       The tool lines the two up by contract number, shows you every difference it finds, and only
-       writes the changes you approve into an updated copy of your file. Nothing is uploaded anywhere:
-       everything runs on this page, in your browser.</p>
+       The tool lines the two up by contract number, rolls the two Paid columns forward with the PDF's
+       Paid amounts, updates the other amounts that changed, and flags new subcontractors and name
+       mismatches for you to double check. Nothing is written without your review, and nothing is
+       uploaded anywhere: everything runs on this page, in your browser.</p>
   </div>
 </header>
 <main>
@@ -86,8 +87,9 @@
   <!-- STEP 1 : uploads -->
   <section class="card" id="card-upload">
     <h2><span class="step">1</span>Upload the two files</h2>
-    <p class="sub">The contracts file is the state you want to update. The PDF log is the newest data that wins.
-       Amounts are compared to the cent. A row whose contract number appears in the PDF but not in your file is proposed as a new row. Nothing is ever deleted.</p>
+    <p class="sub">The contracts file is the state you want to update. The PDF log is the newest data.
+       Amounts are compared to the cent. A row whose contract number appears in the PDF but not in your file is proposed as a new row.
+       A blank in the PDF never overwrites a real amount in your file: it is flagged as a warning instead. Nothing is ever deleted.</p>
     <div class="uploads">
       <div class="drop" id="drop-sheet">
         <div class="big">Contracts file (current state)</div>
@@ -104,7 +106,7 @@
     </div>
     <div class="btnrow">
       <button class="btn secondary" id="btn-sample">Try it with sample data</button>
-      <span class="small" style="color:var(--muted);font-size:12.5px">Sample data is fictional and shows one amount update, two filled-in blanks, and one new subcontractor.</span>
+      <span class="small" style="color:var(--muted);font-size:12.5px">Sample data is fictional and shows a Paid roll with a new payment, one filled-in blank, one new subcontractor, and one name mismatch warning.</span>
     </div>
     <div id="upload-messages"></div>
   </section>
@@ -126,9 +128,9 @@
   <section class="card locked hidden" id="card-mapping">
     <h2><span class="step">3</span>Confirm which columns get updated</h2>
     <p class="sub">The PDF log and your file name their columns differently, so confirm the matches below.
-       Only these four amounts are ever written. The PDF's Pending, Invoiced and Retained amounts have no
-       matching column in the tracking log and are never written.</p>
+       The PDF's Pending, Invoiced and Retained amounts have no matching column in the tracking log and are never written.</p>
     <div class="mapgrid" id="map-grid"></div>
+    <div id="paid-panel" style="margin-top:14px"></div>
     <div class="btnrow">
       <button class="btn" id="btn-compare">Compare the two files</button>
     </div>
@@ -137,7 +139,8 @@
   <!-- STEP 4 : review changes -->
   <section class="card locked hidden" id="card-review">
     <h2><span class="step">4</span>Review the changes</h2>
-    <p class="sub">Every difference found is listed below. Untick anything you do not want applied.
+    <p class="sub">Every difference found is listed below, including the Paid columns rolling forward.
+       Untick anything you do not want applied. Warnings never block anything, they are there for you to double check.
        The updated file is only produced when you press the button, and your original file is never modified.</p>
     <div id="review-body"></div>
   </section>
@@ -343,9 +346,18 @@
     m.original = find(/original/i, used); if (m.original >= 0) used.push(m.original);
     m.approved = find(/approved/i, used); if (m.approved >= 0) used.push(m.approved);
     m.revised = find(/revised/i, used); if (m.revised >= 0) used.push(m.revised);
-    // "Paid" appears twice in the MDOT log (current period end, prior period end).
-    // The current one is the first; the mapping UI shows both labels so the user can confirm.
-    m.paid = find(/paid/i, used); if (m.paid >= 0) used.push(m.paid);
+    // The rolling Paid pair: labels that START with "Paid" ("Paid Amount
+    // (10/31/2026)", "Paid Amount (9/30/2026)"). Leftmost is the most recent
+    // month. "Amount Paid This Period" starts with "Amount", so it is not
+    // part of the pair; it is found separately below.
+    m.paidCols = cols.filter(c => /^paid/i.test(c.label)).map(c => {
+      const dm = c.label.match(/(\d{1,2}[-/]\d{1,2}[-/]\d{4})/);
+      return { idx: c.idx, label: c.label, date: dm ? dm[1] : '' };
+    });
+    for (const p of m.paidCols) used.push(p.idx);
+    m.thisPeriod = find(/amount paid/i, used);
+    if (m.thisPeriod < 0) m.thisPeriod = find(/this period/i, used);
+    if (m.thisPeriod >= 0) used.push(m.thisPeriod);
     m.balance = find(/balance/i, used);
     m.cert = find(/certification/i, used);
     return m;
@@ -517,7 +529,15 @@
       }
     }
     if (!rows.length) warnings.push('No contract rows were extracted from the PDF.');
-    return { rows: rows, totals: totals, warnings: warnings };
+    // The log's printed date (top of page 1), used to prefill the new Paid
+    // column's header date. Reading order: top to bottom, left to right.
+    let logDate = '';
+    const page1 = items.filter(i => i.page === 1).slice().sort((a, b) => (a.y - b.y) || (a.x - b.x));
+    for (const it of page1) {
+      const dm = String(it.str || '').match(/\d{1,2}[-/]\d{1,2}[-/]\d{4}/);
+      if (dm) { logDate = dm[0]; break; }
+    }
+    return { rows: rows, totals: totals, warnings: warnings, logDate: logDate };
   }
 
   // Cross-check: sum of extracted rows per field vs the PDF's printed totals row.
@@ -529,22 +549,57 @@
       out[f] = {
         sum: any ? sum : null,
         printed: totals ? totals.amounts[f] : null,
-        match: (totals && any) ? (sum === totals.amounts[f]) : null
+        match: (totals && any && totals.amounts[f] !== null && totals.amounts[f] !== undefined) ? (sum === totals.amounts[f]) : null
       };
     }
     return out;
   }
 
+  /* ---------------- names and dates ---------------- */
+
+  // Loose name comparison for the mismatch warning: case, punctuation and
+  // spacing are ignored; wording differences are NOT ("Century Fence" vs
+  // "Century Fence Construction" still warns, on purpose).
+  function normalizeName(v) {
+    return String(v || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+
+  function parseDateParts(v) {
+    const m = String(v || '').match(/(\d{1,2})[-/](\d{1,2})[-/](\d{4})/);
+    if (!m) return null;
+    return { month: +m[1], day: +m[2], year: +m[3] };
+  }
+
+  // Render a date in the style of an existing header date ("10/31/2026").
+  function formatDateLike(parts, sample) {
+    if (!parts) return '';
+    const sm = String(sample || '');
+    if (sm.indexOf('-') >= 0 && sm.indexOf('/') < 0) {
+      const p2 = n => String(n).padStart(2, '0');
+      return p2(parts.month) + '-' + p2(parts.day) + '-' + parts.year;
+    }
+    return parts.month + '/' + parts.day + '/' + parts.year;
+  }
+
   /* ---------------- compare ---------------- */
 
-  // mapping: {original: colIdx, approved: colIdx, revised: colIdx, paid: colIdx}
-  // into the MAIN section's columns. Matching itself searches every section.
+  // Compares the PDF rows against the sheet.
+  // - original / approved / revised: per-field updates. A BLANK in the PDF
+  //   never overwrites a real amount in the file; it becomes a warning.
+  // - paid: NOT a plain update. The file keeps a rolling pair of Paid columns
+  //   (most recent month, month before). Each matched row gets a roll plan:
+  //   the PDF's Paid becomes the newest column, the old newest shifts into
+  //   the prior column. A blank PDF Paid with real money in the file is
+  //   skipped with a warning, never zeroed.
+  // - subcontractor name differences (beyond case/punctuation) warn but
+  //   never block; matching is by contract number, case-insensitive.
   function compare(sheet, pdfRows, mapping) {
-    const updates = [];   // {code, rowIdx, sectionIdx, field, colIdx, oldCents, newCents}
-    const additions = []; // pdf rows with no sheet match
-    const unchanged = [];
-    const fields = ['original', 'approved', 'revised', 'paid'];
+    const updates = [], additions = [], unchanged = [], blankWarnings = [], nameWarnings = [], rollRows = [];
+    const fields = ['original', 'approved', 'revised'];
     const pdfCodes = new Set();
+    const paidCols = mapping.paidCols || [];
+    const paidLeftIdx = paidCols.length ? paidCols[0].idx : -1;
+    const paidRightIdx = paidCols.length > 1 ? paidCols[1].idx : -1;
 
     for (const pr of pdfRows) {
       pdfCodes.add(pr.code);
@@ -552,22 +607,47 @@
       if (!hit) { additions.push(pr); continue; }
       const gridRow = sheet.grid[hit.rowIdx];
       let changed = false;
+
       for (const f of fields) {
         const colIdx = mapping[f];
         if (colIdx === undefined || colIdx < 0) continue;
         const oldCents = parseAmountToCents(gridRow[colIdx]);
         const newCents = pr.amounts[f];
-        const o = oldCents === null ? 0 : oldCents;
-        const n = newCents === null ? 0 : newCents;
-        if (o !== n) {
-          updates.push({
-            code: pr.code, rowIdx: hit.rowIdx, field: f, colIdx: colIdx,
-            oldCents: oldCents, newCents: newCents,
-            oldBlank: oldCents === null, newBlank: newCents === null
-          });
+        if (newCents === null || newCents === undefined) {
+          if (oldCents !== null && oldCents !== 0) {
+            blankWarnings.push({ code: pr.code, field: f, oldCents: oldCents });
+          }
+          continue;
+        }
+        if ((oldCents || 0) !== newCents) {
+          updates.push({ code: pr.code, rowIdx: hit.rowIdx, field: f, colIdx: colIdx, oldCents: oldCents, newCents: newCents, oldBlank: oldCents === null, newBlank: false });
           changed = true;
         }
       }
+
+      if (mapping.subcontractor !== undefined && mapping.subcontractor >= 0) {
+        const sheetName = String(gridRow[mapping.subcontractor] || '').trim();
+        if (normalizeName(sheetName) !== normalizeName(pr.subcontractor)) {
+          nameWarnings.push({ code: pr.code, sheetName: sheetName, pdfName: pr.subcontractor });
+        }
+      }
+
+      if (paidLeftIdx >= 0) {
+        const oldLeft = parseAmountToCents(gridRow[paidLeftIdx]);
+        const oldRight = paidRightIdx >= 0 ? parseAmountToCents(gridRow[paidRightIdx]) : null;
+        const pdfPaid = (pr.amounts.paid === undefined) ? null : pr.amounts.paid;
+        let action;
+        if (pdfPaid === null) {
+          action = ((oldLeft !== null && oldLeft !== 0) || (oldRight !== null && oldRight !== 0)) ? 'skip-blank' : 'nochange';
+        } else if (pdfPaid === (oldLeft || 0) && (oldLeft || 0) === (oldRight || 0)) {
+          action = 'nochange';
+        } else {
+          action = 'roll';
+        }
+        rollRows.push({ code: pr.code, rowIdx: hit.rowIdx, action: action, oldLeft: oldLeft, oldRight: oldRight, pdfPaid: pdfPaid });
+        if (action === 'roll') changed = true;
+      }
+
       if (!changed) unchanged.push(pr.code);
     }
 
@@ -578,110 +658,213 @@
         if (!pdfCodes.has(dr.code)) notInPdf.push(dr.code);
       }
     }
-    return { updates: updates, additions: additions, unchanged: unchanged, notInPdf: notInPdf };
+    return { updates: updates, additions: additions, unchanged: unchanged, notInPdf: notInPdf, blankWarnings: blankWarnings, nameWarnings: nameWarnings, rollRows: rollRows };
   }
 
   /* ---------------- apply ---------------- */
 
-  // Applies accepted updates + additions to a COPY of the grid.
-  // Also maintains the file's own arithmetic where it provably holds:
-  //  - Balance column (if mapped) = Revised - Paid, per row, when it held before.
-  //  - Totals row cells that equal the sum of their section before the change are recomputed.
-  // Returns { grid, derivedChanges: [...] }.
-  function applyChanges(grid, sheet, mapping, acceptedUpdates, additions, opts) {
+  // Applies the accepted work to a COPY of the grid.
+  // accepted: { updates: [...], rollRows: [...], additions: [...] }
+  // opts: { newPaidDate: 'M/D/YYYY' } for the newest Paid column's header.
+  // Derived values are only written where the file's own arithmetic PROVES
+  // the rule on the original data (>= 3 fully populated proof rows, zero
+  // violations): Amount Paid This Period = Paid(newest) - Paid(prior), and
+  // Balance to Finish = Revised - Paid(newest). Totals cells are recomputed
+  // only where the printed total exactly equaled the section sum before.
+  function applyChanges(grid, sheet, mapping, accepted, opts) {
     opts = opts || {};
+    accepted = accepted || {};
+    const accUpdates = accepted.updates || [];
+    const accRolls = accepted.rollRows || [];
+    const additions = accepted.additions || [];
     const out = grid.map(r => r.slice());
     const derived = [];
+    const notes = [];
     const mainSection = sheet.sections[0];
+    if (!mainSection) return { grid: out, derivedChanges: derived, notes: ['No contract table was found in the file.'], balanceRuleApplied: false, thisPeriodRuleApplied: false };
 
-    // Verify the balance invariant on the original data before relying on it.
-    // Only rows where Revised, Paid and Balance are ALL present can prove the
-    // rule; require several such rows and zero violations among them.
-    let balanceOk = false;
-    if (mapping.balance !== undefined && mapping.balance >= 0 && mapping.revised >= 0 && mapping.paid >= 0 && mainSection) {
+    const paidCols = mapping.paidCols || [];
+    const origIdx = {
+      original: mapping.original, approved: mapping.approved, revised: mapping.revised,
+      paidLeft: paidCols.length ? paidCols[0].idx : -1,
+      paidRight: paidCols.length > 1 ? paidCols[1].idx : -1,
+      thisPeriod: mapping.thisPeriod, balance: mapping.balance,
+      trade: mapping.trade, subcontractor: mapping.subcontractor
+    };
+
+    function proveRule(fn) {
       let proven = 0, violated = 0;
       for (const dr of mainSection.dataRows) {
-        const rev = parseAmountToCents(grid[dr.rowIdx][mapping.revised]);
-        const paid = parseAmountToCents(grid[dr.rowIdx][mapping.paid]);
-        const bal = parseAmountToCents(grid[dr.rowIdx][mapping.balance]);
-        if (rev === null || paid === null || bal === null) continue;
-        if (rev - paid === bal) proven++; else violated++;
+        const r = fn(grid[dr.rowIdx]);
+        if (r === null) continue;
+        if (r) proven++; else violated++;
       }
-      balanceOk = proven >= 5 && violated === 0;
+      return proven >= 3 && violated === 0;
+    }
+    const balanceOk = origIdx.balance >= 0 && origIdx.revised >= 0 && origIdx.paidLeft >= 0 && proveRule(row => {
+      const rev = parseAmountToCents(row[origIdx.revised]), paid = parseAmountToCents(row[origIdx.paidLeft]), bal = parseAmountToCents(row[origIdx.balance]);
+      if (rev === null || paid === null || bal === null) return null;
+      return rev - paid === bal;
+    });
+    const thisPeriodOk = origIdx.thisPeriod >= 0 && origIdx.paidLeft >= 0 && origIdx.paidRight >= 0 && proveRule(row => {
+      const l = parseAmountToCents(row[origIdx.paidLeft]), r = parseAmountToCents(row[origIdx.paidRight]), tp = parseAmountToCents(row[origIdx.thisPeriod]);
+      if (l === null || r === null || tp === null) return null;
+      return l - r === tp;
+    });
+    // Totals gates, per role, on the ORIGINAL grid.
+    const totalsGate = {};
+    if (mainSection.totalsRowIdx >= 0) {
+      for (const role of ['original', 'approved', 'revised', 'paidLeft', 'paidRight', 'thisPeriod', 'balance']) {
+        const ci = origIdx[role];
+        if (ci === undefined || ci < 0) { totalsGate[role] = false; continue; }
+        let sum = 0;
+        for (const dr of mainSection.dataRows) sum += parseAmountToCents(grid[dr.rowIdx][ci]) || 0;
+        const printed = parseAmountToCents(grid[mainSection.totalsRowIdx][ci]);
+        totalsGate[role] = printed !== null && printed === sum;
+      }
     }
 
+    // Column insertion: the file has ONE Paid column and a roll was accepted.
+    // A new Paid column goes in on its left; the existing one becomes the
+    // prior-month column. Header cells mirror the existing column's labels.
+    let inserted = false;
+    const adj = idx => (inserted && idx >= origIdx.paidLeft) ? idx + 1 : idx;
+    if (origIdx.paidLeft >= 0 && origIdx.paidRight < 0 && accRolls.length) {
+      const at = origIdx.paidLeft;
+      const hdr = mainSection.headerRowIdx;
+      for (let ri = 0; ri < out.length; ri++) {
+        let cell = '';
+        if (ri === hdr || ri === hdr - 1) cell = grid[ri][at];
+        else if (ri === hdr - 2) cell = opts.newPaidDate || '';
+        out[ri].splice(at, 0, cell);
+      }
+      inserted = true;
+      notes.push('The file had only one Paid column, so a new Paid column was added on its left' + (opts.newPaidDate ? ' with the date ' + opts.newPaidDate : '') + '. The existing column became the prior-month column.');
+    }
+    const outIdx = {};
+    for (const role of Object.keys(origIdx)) {
+      if (role === 'paidLeft' && inserted) outIdx.paidLeft = origIdx.paidLeft;
+      else if (role === 'paidRight' && inserted) outIdx.paidRight = origIdx.paidLeft + 1;
+      else outIdx[role] = origIdx[role] >= 0 ? adj(origIdx[role]) : -1;
+    }
+    const outCodeCol = adj(mainSection.codeColIdx);
+
     const touchedRows = new Set();
-    for (const u of acceptedUpdates) {
-      out[u.rowIdx][u.colIdx] = ' ' + formatCents(u.newCents === null ? 0 : u.newCents) + ' ';
+
+    // Field updates.
+    for (const u of accUpdates) {
+      out[u.rowIdx][adj(u.colIdx)] = ' ' + formatCents(u.newCents) + ' ';
       touchedRows.add(u.rowIdx);
     }
 
-    // Derived balance updates for touched rows (only where both inputs exist).
-    if (balanceOk) {
-      for (const rowIdx of touchedRows) {
-        const rev = parseAmountToCents(out[rowIdx][mapping.revised]);
-        const paid = parseAmountToCents(out[rowIdx][mapping.paid]);
-        if (rev === null || paid === null) continue;
-        const bal = parseAmountToCents(out[rowIdx][mapping.balance]);
-        const want = rev - paid;
-        if ((bal || 0) !== want) {
-          out[rowIdx][mapping.balance] = ' ' + formatCents(want) + ' ';
-          derived.push({ kind: 'balance', rowIdx: rowIdx, code: normalizeCode(out[rowIdx][sheet.sections[0].codeColIdx]), oldCents: bal, newCents: want });
+    // Paid roll: prior column takes the old newest values, newest column
+    // takes the PDF's Paid values. Dates roll with the data.
+    if (outIdx.paidLeft >= 0 && outIdx.paidRight >= 0 && accRolls.length) {
+      if (!inserted) {
+        const hdr = mainSection.headerRowIdx;
+        const dateRowOrig = grid[hdr - 2];
+        const oldLeftDate = dateRowOrig ? String(dateRowOrig[origIdx.paidLeft] || '').trim() : '';
+        if (oldLeftDate && parseDateParts(oldLeftDate)) {
+          out[hdr - 2][outIdx.paidRight] = grid[hdr - 2][origIdx.paidLeft];
+          if (opts.newPaidDate) {
+            out[hdr - 2][outIdx.paidLeft] = opts.newPaidDate;
+            notes.push('Paid column dates rolled: the newest column is now dated ' + opts.newPaidDate + ' and the prior column ' + oldLeftDate + '.');
+          } else {
+            notes.push('Paid amounts rolled, but no date was given for the newest column, so its header date was left as ' + oldLeftDate + '. Update it in the file if it should show the new month.');
+          }
+        }
+      }
+      for (const rr of accRolls) {
+        out[rr.rowIdx][outIdx.paidRight] = rr.oldLeft === null ? '' : ' ' + formatCents(rr.oldLeft) + ' ';
+        out[rr.rowIdx][outIdx.paidLeft] = ' ' + formatCents(rr.pdfPaid) + ' ';
+        touchedRows.add(rr.rowIdx);
+      }
+    }
+
+    // Derived: Amount Paid This Period = newest Paid - prior Paid (rolled rows).
+    if (thisPeriodOk && outIdx.thisPeriod >= 0) {
+      for (const rr of accRolls) {
+        const nl = parseAmountToCents(out[rr.rowIdx][outIdx.paidLeft]);
+        const nr = parseAmountToCents(out[rr.rowIdx][outIdx.paidRight]);
+        if (nl === null) continue;
+        const want = nl - (nr || 0);
+        const cur = parseAmountToCents(out[rr.rowIdx][outIdx.thisPeriod]);
+        if ((cur || 0) !== want) {
+          out[rr.rowIdx][outIdx.thisPeriod] = ' ' + formatCents(want) + ' ';
+          derived.push({ kind: 'thisperiod', code: rr.code, oldCents: cur, newCents: want });
         }
       }
     }
 
-    // New rows: insert after the last data row of the main section.
+    // Derived: Balance to Finish = Revised - newest Paid (touched rows).
+    if (balanceOk && outIdx.balance >= 0) {
+      for (const rowIdx of touchedRows) {
+        const rev = parseAmountToCents(out[rowIdx][outIdx.revised]);
+        const paid = parseAmountToCents(out[rowIdx][outIdx.paidLeft]);
+        if (rev === null || paid === null) continue;
+        const bal = parseAmountToCents(out[rowIdx][outIdx.balance]);
+        const want = rev - paid;
+        if ((bal || 0) !== want) {
+          out[rowIdx][outIdx.balance] = ' ' + formatCents(want) + ' ';
+          derived.push({ kind: 'balance', code: normalizeCode(out[rowIdx][outCodeCol]), oldCents: bal, newCents: want });
+        }
+      }
+    }
+
+    // New rows: inserted after the last data row of the main section.
     let insertAt = -1;
-    if (additions.length && mainSection && mainSection.dataRows.length) {
+    if (additions.length && mainSection.dataRows.length) {
       insertAt = mainSection.dataRows[mainSection.dataRows.length - 1].rowIdx + 1;
       const width = Math.max.apply(null, out.map(r => r.length));
-      const newGridRows = additions.map(pr => {
+      const newRows = additions.map(pr => {
         const nr = new Array(width).fill('');
-        nr[mainSection.codeColIdx] = pr.code;
-        if (mapping.subcontractor >= 0) nr[mapping.subcontractor] = pr.subcontractor;
-        if (mapping.trade >= 0) nr[mapping.trade] = pr.description;
-        for (const f of ['original', 'approved', 'revised', 'paid']) {
-          if (mapping[f] >= 0 && pr.amounts[f] !== null && pr.amounts[f] !== undefined) {
-            nr[mapping[f]] = ' ' + formatCents(pr.amounts[f]) + ' ';
+        nr[outCodeCol] = pr.code;
+        if (outIdx.subcontractor >= 0) nr[outIdx.subcontractor] = pr.subcontractor;
+        if (outIdx.trade >= 0) nr[outIdx.trade] = pr.description;
+        for (const f of ['original', 'approved', 'revised']) {
+          if (outIdx[f] >= 0 && pr.amounts[f] !== null && pr.amounts[f] !== undefined) {
+            nr[outIdx[f]] = ' ' + formatCents(pr.amounts[f]) + ' ';
           }
         }
-        if (balanceOk && mapping.balance >= 0 && pr.amounts.revised !== null && pr.amounts.revised !== undefined && pr.amounts.paid !== null && pr.amounts.paid !== undefined) {
-          nr[mapping.balance] = ' ' + formatCents(pr.amounts.revised - pr.amounts.paid) + ' ';
+        if (outIdx.paidLeft >= 0 && pr.amounts.paid !== null && pr.amounts.paid !== undefined) {
+          nr[outIdx.paidLeft] = ' ' + formatCents(pr.amounts.paid) + ' ';
+        }
+        if (balanceOk && outIdx.balance >= 0 && pr.amounts.revised !== null && pr.amounts.revised !== undefined && pr.amounts.paid !== null && pr.amounts.paid !== undefined) {
+          nr[outIdx.balance] = ' ' + formatCents(pr.amounts.revised - pr.amounts.paid) + ' ';
         }
         return nr;
       });
-      out.splice.apply(out, [insertAt, 0].concat(newGridRows));
+      out.splice.apply(out, [insertAt, 0].concat(newRows));
     }
 
-    // Totals row: recompute only the columns whose total provably equaled the
-    // sum of the section's rows BEFORE the changes (the file's own rule).
-    if (mainSection && mainSection.totalsRowIdx >= 0) {
+    // Totals: recompute the roles whose printed total provably was the
+    // section sum (plus the brand-new Paid column after an insertion).
+    if (mainSection.totalsRowIdx >= 0) {
       const totalsIdx = mainSection.totalsRowIdx + (insertAt >= 0 && mainSection.totalsRowIdx >= insertAt ? additions.length : 0);
-      const colsToCheck = new Set([mapping.original, mapping.approved, mapping.revised, mapping.paid, mapping.balance].filter(c => c !== undefined && c >= 0));
-      for (const ci of colsToCheck) {
-        let before = 0;
-        for (const dr of mainSection.dataRows) before += parseAmountToCents(grid[dr.rowIdx][ci]) || 0;
-        const printedBefore = parseAmountToCents(grid[mainSection.totalsRowIdx][ci]);
-        if (printedBefore === null || printedBefore !== before) continue; // not a plain sum: leave it
+      for (const role of ['original', 'approved', 'revised', 'paidLeft', 'paidRight', 'thisPeriod', 'balance']) {
+        const ci = outIdx[role];
+        if (ci === undefined || ci < 0) continue;
+        const isNewPaidCol = inserted && role === 'paidLeft';
+        if (!totalsGate[role] && !isNewPaidCol) continue;
         let after = 0;
-        const start = mainSection.headerRowIdx + 1;
-        for (let ri = start; ri < totalsIdx; ri++) {
-          if (isContractCode(out[ri][mainSection.codeColIdx])) after += parseAmountToCents(out[ri][ci]) || 0;
+        for (let ri = mainSection.headerRowIdx + 1; ri < totalsIdx; ri++) {
+          if (isContractCode(out[ri][outCodeCol])) after += parseAmountToCents(out[ri][ci]) || 0;
         }
+        const printedBefore = isNewPaidCol ? null : parseAmountToCents(grid[mainSection.totalsRowIdx][origIdx[role]]);
         if (after !== printedBefore) {
           out[totalsIdx][ci] = ' ' + formatCents(after) + ' ';
-          derived.push({ kind: 'total', colIdx: ci, oldCents: printedBefore, newCents: after });
+          derived.push({ kind: 'total', colIdx: ci, role: role, oldCents: printedBefore, newCents: after });
         }
       }
     }
 
-    return { grid: out, derivedChanges: derived, balanceRuleApplied: balanceOk };
+    return { grid: out, derivedChanges: derived, notes: notes, balanceRuleApplied: balanceOk, thisPeriodRuleApplied: thisPeriodOk };
   }
 
   const api = {
     parseAmountToCents, formatCents, formatCentsPlain,
-    isContractCode, normalizeCode,
+    isContractCode, normalizeCode, normalizeName,
+    parseDateParts, formatDateLike,
     parseCSV, serializeCSV,
     buildSheetModel, suggestMapping,
     extractPdfRows, totalsCheck, PDF_FIELDS,
@@ -699,9 +882,9 @@
 const C = window.SLUCore;
 const $ = id => document.getElementById(id);
 const state = {
-  sheetName:'', sheetGrid:null, sheetModel:null, isXlsx:false, sheetCellTypes:null,
-  pdfName:'', pdfRows:[], pdfTotals:null, pdfWarnings:[],
-  mapping:null, cmp:null, appliedInfo:null
+  sheetName:'', sheetGrid:null, sheetModel:null, isXlsx:false,
+  pdfName:'', pdfRows:[], pdfTotals:null, pdfWarnings:[], pdfLogDate:'',
+  mapping:null, cmp:null
 };
 
 function msg(container, kind, html){
@@ -710,11 +893,20 @@ function msg(container, kind, html){
   $(container).appendChild(d); return d;
 }
 function unlock(id){ const el = $(id); el.classList.remove('hidden'); el.classList.remove('locked'); el.scrollIntoView({behavior:'smooth', block:'start'}); }
+function relock(){
+  for(const id of ['card-extract','card-mapping','card-review','card-result']){
+    $(id).classList.add('hidden'); $(id).classList.add('locked');
+  }
+  state.cmp = null;
+}
 function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+const FIELD_LABEL = {original:'Original', pending:'Pending', approved:'Approved', revised:'Revised', invoiced:'Invoiced', retained:'Retained', paid:'Paid'};
+const AMT_FIELDS = ['original','pending','approved','revised','invoiced','retained','paid'];
 
 /* ---------- file loading ---------- */
 
 function handleSheetFile(file){
+  relock();
   state.sheetName = file.name;
   const isX = /\.(xlsx|xls)$/i.test(file.name);
   state.isXlsx = isX;
@@ -748,6 +940,7 @@ function handleSheetFile(file){
 }
 
 function handlePdfFile(file){
+  relock();
   state.pdfName = file.name;
   const rd = new FileReader();
   rd.onload = async function(){
@@ -764,12 +957,12 @@ function handlePdfFile(file){
         }
       }
       const ext = C.extractPdfRows(items);
-      state.pdfRows = ext.rows; state.pdfTotals = ext.totals; state.pdfWarnings = ext.warnings;
+      state.pdfRows = ext.rows; state.pdfTotals = ext.totals; state.pdfWarnings = ext.warnings; state.pdfLogDate = ext.logDate || '';
       if(!ext.rows.length){
         msg('upload-messages','bad','<strong>No rows could be read from that PDF.</strong> ' + esc(ext.warnings.join(' ')) + ' The log must be a text-based PDF (for example Microsoft Print to PDF), not a scan or photo.');
         return;
       }
-      $('pdf-ok').textContent = 'Loaded: ' + file.name + ' — ' + ext.rows.length + ' rows read' + (ext.totals ? ', totals row found' : ', no totals row found');
+      $('pdf-ok').textContent = 'Loaded: ' + file.name + ' — ' + ext.rows.length + ' rows read' + (ext.totals ? ', totals row found' : ', no totals row found') + (ext.logDate ? ', log date ' + ext.logDate : '');
       $('pdf-ok').classList.remove('hidden');
       maybeReady();
     }catch(e){
@@ -785,9 +978,6 @@ function maybeReady(){
 
 /* ---------- step 2: extraction review ---------- */
 
-const AMT_FIELDS = ['original','pending','approved','revised','invoiced','retained','paid'];
-const FIELD_LABEL = {original:'Original', pending:'Pending', approved:'Approved', revised:'Revised', invoiced:'Invoiced', retained:'Retained', paid:'Paid'};
-
 function renderExtract(){
   const tc = C.totalsCheck(state.pdfRows, state.pdfTotals);
   let html = '';
@@ -801,7 +991,7 @@ function renderExtract(){
       return '<td class="num"><span class="pill '+(tc[f].match?'ok':'bad')+'">'+(tc[f].match?'match':'DIFFERENT')+'</span></td>';
     }).join('') + '</tr></table>';
     html += allOk
-      ? '<div class="note ok">Totals check passed: the rows read from the PDF add up exactly to the totals printed on the log, for every amount column.</div>'
+      ? '<div class="note ok">Totals check passed: the rows read from the PDF add up exactly to the totals printed on the log, for every amount column the log prints a total for.</div>'
       : '<div class="note bad"><strong>Totals check failed.</strong> At least one column does not add up to the printed total, which means a row was missed or a number was misread. Review the table below carefully before comparing.</div>';
   } else {
     html += '<div class="note warn">No totals row was found in the PDF, so the automatic totals check is unavailable. Review the extracted rows carefully.</div>';
@@ -838,10 +1028,6 @@ function renderExtract(){
 }
 
 function renderTotalsOnly(){
-  // Recompute just the check table after an edit, without rebuilding the inputs.
-  renderExtractSoft();
-}
-function renderExtractSoft(){
   const tc = C.totalsCheck(state.pdfRows, state.pdfTotals);
   if(!state.pdfTotals) return;
   const rows = $('totals-check').querySelectorAll('table tr');
@@ -857,15 +1043,36 @@ function renderExtractSoft(){
 
 /* ---------- step 3: mapping ---------- */
 
+function dateFieldHtml(currentDate){
+  const pre = state.pdfLogDate ? C.formatDateLike(C.parseDateParts(state.pdfLogDate), currentDate || '10/31/2026') : '';
+  return '<div style="margin-top:12px"><label style="display:block;font-size:12.5px;font-weight:600;color:var(--muted);margin-bottom:5px">Date for the newest Paid column</label>' +
+    '<input type="text" id="paid-date" value="' + esc(pre) + '" placeholder="e.g. 11/30/2026" style="padding:7px 9px;border:1px solid var(--line);border-radius:7px;font-size:13.5px">' +
+    '<div style="font-size:12.5px;color:var(--muted);margin-top:4px">Prefilled from the PDF log date' + (state.pdfLogDate ? ' (' + esc(state.pdfLogDate) + ')' : '') +
+    '. If your file uses month-end dates, change it to the month-end date. The prior column automatically takes over the date of the current newest column.</div></div>';
+}
+
 function renderMapping(){
   const section = state.sheetModel.sections[0];
   state.mapping = C.suggestMapping(section);
   const cols = section.columns.filter(c => c.label);
-  const fields = [['original','PDF "Original Amount" updates'], ['approved','PDF "Approved Amount" updates'], ['revised','PDF "Revised Amount" updates'], ['paid','PDF "Paid Amount" updates']];
+  const fields = [['original','PDF "Original Amount" updates'], ['approved','PDF "Approved Amount" updates'], ['revised','PDF "Revised Amount" updates']];
   $('map-grid').innerHTML = fields.map(([f, label]) =>
     '<div><label>' + label + '</label><select id="map-' + f + '">' +
     cols.map(c => '<option value="' + c.idx + '"' + (state.mapping[f] === c.idx ? ' selected' : '') + '>' + esc(c.label) + '</option>').join('') +
     '</select></div>').join('');
+  const pc = state.mapping.paidCols || [];
+  let html = '';
+  if(pc.length >= 2){
+    html = '<div class="note info"><strong>Paid columns roll forward.</strong> Your file keeps two Paid columns: <strong>' + esc(pc[0].label) + '</strong> (newest) and <strong>' + esc(pc[1].label) + '</strong> (prior). ' +
+      'On apply, the prior column is overwritten with the newest column\'s current values, the newest column is overwritten with the PDF\'s Paid amounts, and "Amount Paid This Period" is recalculated as newest minus prior for each rolled row.</div>' + dateFieldHtml(pc[0].date);
+    if(pc.length > 2) html += '<div class="note warn">Your file has more than two Paid columns. Only the two leftmost (newest) ones roll; the rest are left untouched.</div>';
+  } else if(pc.length === 1){
+    html = '<div class="note info"><strong>Paid column rolls forward.</strong> Your file has one Paid column: <strong>' + esc(pc[0].label) + '</strong>. ' +
+      'On apply, a new Paid column is added on its left holding the PDF\'s Paid amounts, and the existing column becomes the prior-month column.</div>' + dateFieldHtml(pc[0].date);
+  } else {
+    html = '<div class="note warn"><strong>No Paid column was found in your file.</strong> The PDF\'s Paid amounts will not be written. Original, Approved and Revised still update normally.</div>';
+  }
+  $('paid-panel').innerHTML = html;
   unlock('card-mapping');
 }
 
@@ -873,8 +1080,24 @@ function renderMapping(){
 
 function currentMapping(){
   const m = Object.assign({}, state.mapping);
-  for(const f of ['original','approved','revised','paid']) m[f] = +$('map-' + f).value;
+  for(const f of ['original','approved','revised']) m[f] = +$('map-' + f).value;
   return m;
+}
+
+function warningsHtml(cmp){
+  let html = '';
+  if(cmp.nameWarnings.length){
+    html += '<div class="note warn"><strong>Name mismatches (matched by contract number anyway, double check these):</strong><ul style="margin:6px 0 0;padding-left:18px">' +
+      cmp.nameWarnings.map(w => '<li><span class="mono">' + esc(w.code) + '</span>: your file says "' + esc(w.sheetName) + '", the PDF says "' + esc(w.pdfName) + '"</li>').join('') + '</ul></div>';
+  }
+  const blanks = cmp.blankWarnings.map(w => '<li><span class="mono">' + esc(w.code) + '</span>: the PDF shows no ' + FIELD_LABEL[w.field] + ' amount, but your file has ' + C.formatCentsPlain(w.oldCents) + '. Left unchanged.</li>');
+  for(const r of cmp.rollRows){
+    if(r.action === 'skip-blank') blanks.push('<li><span class="mono">' + esc(r.code) + '</span>: the PDF shows no Paid amount, but your file has ' + C.formatCentsPlain(r.oldLeft) + ' in the newest Paid column. That row\'s Paid columns were left untouched.</li>');
+  }
+  if(blanks.length){
+    html += '<div class="note warn"><strong>Blanks in the PDF (nothing was overwritten):</strong><ul style="margin:6px 0 0;padding-left:18px">' + blanks.join('') + '</ul></div>';
+  }
+  return html;
 }
 
 function renderReview(){
@@ -884,15 +1107,19 @@ function renderReview(){
   state.cmp = cmp;
   const section = state.sheetModel.sections[0];
   const colLabel = idx => (section.columns.find(c => c.idx === idx) || {}).label || ('column ' + idx);
+  const rollList = cmp.rollRows.filter(r => r.action === 'roll');
   let html = '<div class="counts">' +
     '<div class="count"><div class="n">' + cmp.updates.length + '</div><div class="l">amount updates</div></div>' +
+    '<div class="count"><div class="n">' + rollList.length + '</div><div class="l">paid rolls</div></div>' +
     '<div class="count"><div class="n">' + cmp.additions.length + '</div><div class="l">new rows to add</div></div>' +
     '<div class="count"><div class="n">' + cmp.unchanged.length + '</div><div class="l">rows unchanged</div></div>' +
     '<div class="count"><div class="n">' + cmp.notInPdf.length + '</div><div class="l">in your file, not in the PDF</div></div></div>';
 
-  if(!cmp.updates.length && !cmp.additions.length){
+  html += warningsHtml(cmp);
+
+  if(!cmp.updates.length && !rollList.length && !cmp.additions.length){
     html += '<div class="nochange"><div class="big">No changes found</div>' +
-      '<p style="color:var(--muted)">Every contract in the PDF log already matches your file on all four compared amounts, ' +
+      '<p style="color:var(--muted)">Every contract in the PDF log already matches your file, the Paid columns are already rolled to this log, ' +
       'and the PDF contains no new contract numbers. Your file is already up to date with this log.</p></div>';
     if(cmp.notInPdf.length) html += '<div class="note info">For information only: these contracts are in your file but do not appear in this PDF log, so they were left untouched: ' + cmp.notInPdf.map(esc).join(', ') + '</div>';
     $('review-body').innerHTML = html;
@@ -901,16 +1128,37 @@ function renderReview(){
   }
 
   if(cmp.updates.length){
-    html += '<h3 style="margin:16px 0 8px;font-size:15px">Amount updates</h3><div class="scroll"><table>' +
+    html += '<h3 style="margin:16px 0 8px;font-size:15px">Amount updates (Original, Approved, Revised)</h3><div class="scroll"><table>' +
       '<tr><th></th><th>Contract</th><th>Field</th><th>Column in your file</th><th class="num">Current value</th><th class="num">New value (PDF)</th></tr>';
     cmp.updates.forEach((u, i) => {
       html += '<tr class="changed"><td><input type="checkbox" data-upd="' + i + '" checked></td>' +
         '<td class="mono"><strong>' + esc(u.code) + '</strong></td><td>' + FIELD_LABEL[u.field] + '</td><td>' + esc(colLabel(u.colIdx)) + '</td>' +
         '<td class="num mono">' + (u.oldBlank ? '(blank)' : C.formatCentsPlain(u.oldCents)) + '</td>' +
-        '<td class="num mono"><strong>' + (u.newBlank ? '(blank)' : C.formatCentsPlain(u.newCents)) + '</strong></td></tr>';
+        '<td class="num mono"><strong>' + C.formatCentsPlain(u.newCents) + '</strong></td></tr>';
     });
     html += '</table></div>';
   }
+
+  if(rollList.length){
+    const tpIdx = m.thisPeriod;
+    html += '<h3 style="margin:16px 0 8px;font-size:15px">Paid columns roll forward</h3><div class="scroll"><table>' +
+      '<tr><th></th><th>Contract</th><th class="num">Paid (newest): current</th><th class="num">Paid (newest): from PDF</th><th class="num">Paid (prior): current</th><th class="num">Paid (prior): after roll</th><th class="num">Paid this month</th></tr>';
+    rollList.forEach((r, i) => {
+      const sheetRow = state.sheetGrid[r.rowIdx];
+      const curTp = tpIdx >= 0 ? C.parseAmountToCents(sheetRow[tpIdx]) : null;
+      const newTp = r.pdfPaid - (r.oldLeft || 0);
+      html += '<tr class="changed"><td><input type="checkbox" data-roll="' + i + '" checked></td>' +
+        '<td class="mono"><strong>' + esc(r.code) + '</strong></td>' +
+        '<td class="num mono">' + C.formatCentsPlain(r.oldLeft) + '</td>' +
+        '<td class="num mono"><strong>' + C.formatCentsPlain(r.pdfPaid) + '</strong></td>' +
+        '<td class="num mono">' + C.formatCentsPlain(r.oldRight) + '</td>' +
+        '<td class="num mono"><strong>' + C.formatCentsPlain(r.oldLeft) + '</strong></td>' +
+        '<td class="num mono">' + C.formatCentsPlain(curTp) + ' &rarr; <strong>' + C.formatCentsPlain(newTp) + '</strong></td></tr>';
+    });
+    html += '</table></div>';
+    html += '<div class="note info">The prior column takes over the current newest values, and the newest column takes the PDF\'s Paid amounts. "Paid this month" is newest minus prior after the roll.</div>';
+  }
+
   if(cmp.additions.length){
     html += '<h3 style="margin:16px 0 8px;font-size:15px">New rows from the PDF</h3><div class="scroll"><table>' +
       '<tr><th></th><th>Contract</th><th>Subcontractor</th><th>Description</th><th class="num">Original</th><th class="num">Approved</th><th class="num">Revised</th><th class="num">Paid</th></tr>';
@@ -920,7 +1168,7 @@ function renderReview(){
         ['original','approved','revised','paid'].map(f => '<td class="num mono">' + C.formatCentsPlain(a.amounts[f]) + '</td>').join('') + '</tr>';
     });
     html += '</table></div>';
-    html += '<div class="note info">New rows are inserted at the end of the main contract list, before the totals row. Certification number and MBE columns are left blank, since the PDF log does not carry them.</div>';
+    html += '<div class="note info">New rows are inserted at the end of the main contract list, before the totals row. The Paid amount goes into the newest Paid column; the prior Paid column and Certification / MBE columns are left blank, since the PDF log does not carry them.</div>';
   }
   if(cmp.notInPdf.length){
     html += '<div class="note info">For information only: these contracts are in your file but do not appear in this PDF log, so they stay untouched: ' + cmp.notInPdf.map(esc).join(', ') + '</div>';
@@ -945,22 +1193,24 @@ function applyAndBuild(){
   const acceptedUpdates = cmp.updates.filter((u, i) => {
     const cb = document.querySelector('[data-upd="' + i + '"]'); return cb && cb.checked;
   });
+  const rollList = cmp.rollRows.filter(r => r.action === 'roll');
+  const acceptedRolls = rollList.filter((r, i) => {
+    const cb = document.querySelector('[data-roll="' + i + '"]'); return cb && cb.checked;
+  });
   const acceptedAdds = cmp.additions.filter((a, i) => {
     const cb = document.querySelector('[data-add="' + i + '"]'); return cb && cb.checked;
   });
-  const res = C.applyChanges(state.sheetGrid, state.sheetModel, m, acceptedUpdates, acceptedAdds, {});
-  state.appliedInfo = { updates: acceptedUpdates, additions: acceptedAdds, derived: res.derivedChanges, balanceOk: res.balanceRuleApplied };
+  const dateInput = $('paid-date');
+  const newPaidDate = dateInput ? dateInput.value.trim() : '';
+  const res = C.applyChanges(state.sheetGrid, state.sheetModel, m,
+    { updates: acceptedUpdates, rollRows: acceptedRolls, additions: acceptedAdds }, { newPaidDate: newPaidDate });
 
   const base = state.sheetName.replace(/\.(csv|xlsx|xls)$/i, '');
   let outName, blob;
   if(state.isXlsx){
-    // Decide per COLUMN whether amounts are numbers in the source workbook
-    // (row positions shift when new rows are inserted, so same-cell lookup is
-    // unreliable). Numeric columns get real numbers back, so Excel sums and
-    // formulas keep working; text columns keep the file's own string format.
     const colNumeric = [];
     const width = Math.max.apply(null, state.sheetGrid.map(r => r.length));
-    for(let ci = 0; ci < width; ci++){
+    for(let ci = 0; ci < width + 1; ci++){
       let nums = 0, strs = 0;
       for(const row of state.sheetGrid){
         const v = row[ci];
@@ -968,6 +1218,11 @@ function applyAndBuild(){
         else if(typeof v === 'string' && C.parseAmountToCents(v) !== null) strs++;
       }
       colNumeric[ci] = nums > 0 && nums >= strs;
+    }
+    if(res.grid.length && res.grid[0].length > width){
+      // A Paid column was inserted: it takes the numeric style of the old Paid column.
+      const src = (m.paidCols && m.paidCols.length) ? m.paidCols[0].idx : -1;
+      if(src >= 0) colNumeric.splice(src, 0, colNumeric[src]);
     }
     const gridOut = res.grid.map(row => row.map((cell, ci) => {
       if(typeof cell === 'string' && colNumeric[ci]){
@@ -991,25 +1246,45 @@ function applyAndBuild(){
     ['Contracts file', state.sheetName], ['PDF log', state.pdfName || '(sample data)'],
     ['Generated', new Date().toLocaleString()], [],
     ['Type','Contract','Field / detail','Old value','New value']];
-  for(const u of acceptedUpdates) rep.push(['Update', u.code, FIELD_LABEL[u.field], u.oldBlank ? '(blank)' : C.formatCentsPlain(u.oldCents), u.newBlank ? '(blank)' : C.formatCentsPlain(u.newCents)]);
-  for(const a of acceptedAdds) rep.push(['New row', a.code, a.subcontractor + ' / ' + a.description, '', 'Original ' + C.formatCentsPlain(a.amounts.original) + ', Revised ' + C.formatCentsPlain(a.amounts.revised)]);
+  for(const u of acceptedUpdates) rep.push(['Update', u.code, FIELD_LABEL[u.field], u.oldBlank ? '(blank)' : C.formatCentsPlain(u.oldCents), C.formatCentsPlain(u.newCents)]);
+  for(const r of acceptedRolls) rep.push(['Paid roll', r.code, 'Paid columns rolled forward',
+    'Newest ' + C.formatCentsPlain(r.oldLeft) + ', prior ' + C.formatCentsPlain(r.oldRight),
+    'Newest ' + C.formatCentsPlain(r.pdfPaid) + ', prior ' + C.formatCentsPlain(r.oldLeft) + ', paid this month ' + C.formatCentsPlain(r.pdfPaid - (r.oldLeft || 0))]);
+  for(const a of acceptedAdds) rep.push(['New row', a.code, a.subcontractor + ' / ' + a.description, '', 'Original ' + C.formatCentsPlain(a.amounts.original) + ', Revised ' + C.formatCentsPlain(a.amounts.revised) + ', Paid ' + C.formatCentsPlain(a.amounts.paid)]);
+  const roleLabel = { original:'Original', approved:'Approved', revised:'Revised', paidLeft:'Paid (newest)', paidRight:'Paid (prior)', thisPeriod:'Amount Paid This Period', balance:'Balance to Finish' };
   for(const d of res.derivedChanges){
     if(d.kind === 'balance') rep.push(['Recalculated', d.code, 'Balance to Finish (Revised - Paid)', C.formatCentsPlain(d.oldCents), C.formatCentsPlain(d.newCents)]);
-    else rep.push(['Recalculated', '', 'Totals row, column ' + (d.colIdx + 1), C.formatCentsPlain(d.oldCents), C.formatCentsPlain(d.newCents)]);
+    else if(d.kind === 'thisperiod') rep.push(['Recalculated', d.code, 'Amount Paid This Period (newest Paid - prior Paid)', C.formatCentsPlain(d.oldCents), C.formatCentsPlain(d.newCents)]);
+    else rep.push(['Recalculated', '', 'Totals row, ' + (roleLabel[d.role] || ('column ' + (d.colIdx + 1))), C.formatCentsPlain(d.oldCents), C.formatCentsPlain(d.newCents)]);
   }
-  const skipped = cmp.updates.length - acceptedUpdates.length + (cmp.additions.length - acceptedAdds.length);
+  for(const n of res.notes) rep.push(['Note', '', n, '', '']);
+  for(const w of cmp.nameWarnings) rep.push(['Warning - name mismatch', w.code, 'Matched by contract number anyway. Double check.', 'File: ' + w.sheetName, 'PDF: ' + w.pdfName]);
+  for(const w of cmp.blankWarnings) rep.push(['Warning - PDF blank, left unchanged', w.code, FIELD_LABEL[w.field], C.formatCentsPlain(w.oldCents), '(blank in PDF)']);
+  for(const r of cmp.rollRows) if(r.action === 'skip-blank') rep.push(['Warning - PDF blank, left unchanged', r.code, 'Paid', C.formatCentsPlain(r.oldLeft), '(blank in PDF)']);
+  const skipped = (cmp.updates.length - acceptedUpdates.length) + (rollList.length - acceptedRolls.length) + (cmp.additions.length - acceptedAdds.length);
   if(skipped) rep.push(['Skipped by user', '', skipped + ' change(s) were unticked and not applied', '', '']);
   if(cmp.notInPdf.length) rep.push(['Info', '', 'In the contracts file but not in the PDF log (left untouched)', cmp.notInPdf.join(', '), '']);
+  for(const code of cmp.unchanged) rep.push(['No change', code, '', '', '']);
   const repBlob = new Blob([C.serializeCSV(rep)], {type:'text/csv'});
 
-  let html = '<div class="note ok"><strong>Updated file built.</strong> ' + acceptedUpdates.length + ' amount update(s) and ' +
-    acceptedAdds.length + ' new row(s) were applied to a copy of your file. Your original file was not touched.</div>';
+  let html = '<div class="note ok"><strong>Updated file built.</strong> ' + acceptedUpdates.length + ' amount update(s), ' +
+    acceptedRolls.length + ' Paid roll(s) and ' + acceptedAdds.length + ' new row(s) were applied to a copy of your file. Your original file was not touched.</div>';
+  for(const n of res.notes) html += '<div class="note info">' + esc(n) + '</div>';
   if(res.derivedChanges.length){
     html += '<div class="note info"><strong>Also recalculated, so the file stays internally consistent:</strong><ul style="margin:6px 0 0;padding-left:18px">' +
-      res.derivedChanges.map(d => d.kind === 'balance'
-        ? '<li>' + esc(d.code) + ': Balance to Finish ' + C.formatCentsPlain(d.oldCents) + ' &rarr; ' + C.formatCentsPlain(d.newCents) + ' (Revised minus Paid)</li>'
-        : '<li>Totals row, column ' + (d.colIdx + 1) + ': ' + C.formatCentsPlain(d.oldCents) + ' &rarr; ' + C.formatCentsPlain(d.newCents) + ' (sum of the contract rows)</li>').join('') +
-      '</ul></div>';
+      res.derivedChanges.map(d => {
+        if(d.kind === 'balance') return '<li>' + esc(d.code) + ': Balance to Finish ' + C.formatCentsPlain(d.oldCents) + ' &rarr; ' + C.formatCentsPlain(d.newCents) + '</li>';
+        if(d.kind === 'thisperiod') return '<li>' + esc(d.code) + ': Amount Paid This Period ' + C.formatCentsPlain(d.oldCents) + ' &rarr; ' + C.formatCentsPlain(d.newCents) + '</li>';
+        return '<li>Totals row, ' + esc(roleLabel[d.role] || ('column ' + (d.colIdx + 1))) + ': ' + C.formatCentsPlain(d.oldCents) + ' &rarr; ' + C.formatCentsPlain(d.newCents) + '</li>';
+      }).join('') + '</ul></div>';
+  }
+  if(cmp.nameWarnings.length){
+    html += '<div class="note warn"><strong>Name mismatches to double check:</strong><ul style="margin:6px 0 0;padding-left:18px">' +
+      cmp.nameWarnings.map(w => '<li><span class="mono">' + esc(w.code) + '</span>: file "' + esc(w.sheetName) + '" vs PDF "' + esc(w.pdfName) + '"</li>').join('') + '</ul></div>';
+  }
+  if(cmp.unchanged.length){
+    html += '<details style="margin:10px 0"><summary style="cursor:pointer;font-weight:600">Contracts that did not change (' + cmp.unchanged.length + ')</summary>' +
+      '<p class="mono" style="font-size:12.5px;line-height:1.7">' + cmp.unchanged.map(esc).join(', ') + '</p></details>';
   }
   html += '<div class="btnrow"><button class="btn" id="dl-file">Download ' + esc(outName) + '</button>' +
     '<button class="btn secondary" id="dl-report">Download the change report (CSV)</button></div>';
@@ -1023,8 +1298,8 @@ function applyAndBuild(){
 
 $('file-sheet').addEventListener('change', e => { if(e.target.files[0]) handleSheetFile(e.target.files[0]); });
 $('file-pdf').addEventListener('change', e => { if(e.target.files[0]) handlePdfFile(e.target.files[0]); });
-for(const [dropId, inputId] of [['drop-sheet','file-sheet'],['drop-pdf','file-pdf']]){
-  const dz = $(dropId);
+for(const pair of [['drop-sheet','file-sheet'],['drop-pdf','file-pdf']]){
+  const dz = $(pair[0]), inputId = pair[1];
   dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('over'); });
   dz.addEventListener('dragleave', () => dz.classList.remove('over'));
   dz.addEventListener('drop', e => {
@@ -1039,15 +1314,16 @@ $('btn-compare').addEventListener('click', renderReview);
 /* ---------- sample data ---------- */
 
 $('btn-sample').addEventListener('click', () => {
+  relock();
   const sampleCSV = [
-    ',,,,,,11/30/2026,10/31/2026,,,,,',
+    ',,,,,,,10/31/2026,9/30/2026,,,,,',
     ',,,,Original,Approved Change Order,Revised Contract,Paid, Paid ,Amount Paid , Balance ,MBE Credit,,',
     'Contract #,Subcontractor,Certification Number,Trade,Amount,Amount,Amount,Amount, Amount ,This Period, to Finish ,To date,This Period,',
     'SC-100-001,Acme Builders LLC,,Concrete," $500,000.00 "," $25,000.00 "," $525,000.00 "," $300,000.00 "," $280,000.00 "," $20,000.00 "," $225,000.00 ",,,',
-    'SC-100-002,Beta Electric Inc,,Electrical," $240,000.00 ",," $240,000.00 "," $96,000.00 "," $96,000.00 ", $-   ," $144,000.00 ",,,',
+    'SC-100-002,Beta Electric,,Electrical," $240,000.00 ",," $240,000.00 "," $96,000.00 "," $96,000.00 ", $-   ," $144,000.00 ",,,',
     'SC-100-003,Gamma Roofing Co,,Roofing," $180,000.00 "," $10,000.00 ",," $50,000.00 "," $50,000.00 ", $-   ,,,,,',
-    ',,,,, $-   , $-   , $-   , $-   , $-   , $-   , $-   ,,',
-    ',,**,,\" $920,000.00 \",\" $35,000.00 \",\" $765,000.00 \",\" $446,000.00 \",\" $426,000.00 \",\" $20,000.00 \",\" $369,000.00 \",,,'
+    'SC-100-005,Epsilon Paving,,Paving," $60,000.00 ",," $60,000.00 "," $60,000.00 "," $60,000.00 ", $-   , $-   ,,,',
+    ',,**,,\" $980,000.00 \",\" $35,000.00 \",\" $825,000.00 \",\" $506,000.00 \",\" $486,000.00 \",\" $20,000.00 \",\" $369,000.00 \",,,'
   ].join('\n');
   state.sheetName = 'sample-contracts.csv'; state.isXlsx = false;
   state.sheetGrid = C.parseCSV(sampleCSV);
@@ -1057,15 +1333,17 @@ $('btn-sample').addEventListener('click', () => {
   const mk = (code, description, subcontractor, amounts) => ({ code, description, subcontractor, status:'Committed',
     amounts: Object.assign({original:null,pending:null,approved:null,revised:null,invoiced:null,retained:null,paid:null}, amounts) });
   state.pdfName = '(sample data)';
+  state.pdfLogDate = '11-05-2026';
   state.pdfRows = [
     mk('SC-100-001','Concrete','Acme Builders LLC', {original:50000000, approved:2500000, revised:52500000, paid:31250000}),
     mk('SC-100-002','Electrical','Beta Electric Inc', {original:24000000, approved:null, revised:24000000, paid:9600000}),
     mk('SC-100-003','Roofing','Gamma Roofing Co', {original:18000000, approved:1000000, revised:19000000, paid:5000000}),
-    mk('SC-100-004','Plumbing','Delta Plumbing LLC', {original:9500000, approved:null, revised:9500000, paid:0})
+    mk('SC-100-004','Plumbing','Delta Plumbing LLC', {original:9500000, approved:null, revised:9500000, paid:0}),
+    mk('SC-100-005','Paving','Epsilon Paving', {original:6000000, approved:null, revised:6000000, paid:6000000})
   ];
   state.pdfTotals = { code:'TOTALS', description:'', subcontractor:'', status:'',
-    amounts:{original:101500000, pending:null, approved:3500000, revised:105000000, invoiced:null, retained:null, paid:49850000} };
-  state.pdfWarnings = ['You are viewing fictional sample data. SC-100-001 has a changed Paid amount, SC-100-003 has a Revised amount filled in, and SC-100-004 is a new subcontractor.'];
+    amounts:{original:107500000, pending:null, approved:3500000, revised:111000000, invoiced:null, retained:null, paid:51850000} };
+  state.pdfWarnings = ['You are viewing fictional sample data. SC-100-001 got a new payment (Paid rolls forward), SC-100-003 has a Revised amount filled in, SC-100-004 is a new subcontractor, and SC-100-002 has a name mismatch warning (Beta Electric vs Beta Electric Inc).'];
   $('pdf-ok').textContent = 'Sample PDF data loaded (fictional).';
   $('pdf-ok').classList.remove('hidden');
   renderExtract();
@@ -1073,5 +1351,6 @@ $('btn-sample').addEventListener('click', () => {
 });
 })();
 </script>
+
 </body>
 </html>
